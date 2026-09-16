@@ -50,8 +50,7 @@ pub fn SkipList(comptime Key: type, comptime Cmp: type) type {
 
         pub fn init(cmp: Cmp, arena: *Arena) !Self {
             const head = try newNode(arena, undefined, max_height);
-            var i: usize = 0;
-            while (i < max_height) : (i += 1) head.next[i] = .init(null);
+            for (&head.next) |*link| link.* = .init(null);
 
             return .{
                 .cmp = cmp,
@@ -67,8 +66,7 @@ pub fn SkipList(comptime Key: type, comptime Cmp: type) type {
             const node: *Node = @ptrCast(@alignCast(mem.ptr));
             node.key = key;
             node.height = height;
-            var i: usize = 0;
-            while (i < height) : (i += 1) node.next[i] = .init(null);
+            for (node.next[0..height]) |*link| link.* = .init(null);
             return node;
         }
 

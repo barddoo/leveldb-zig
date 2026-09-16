@@ -387,8 +387,7 @@ pub const Version = struct {
                 matches += 1;
             }
         }
-        var level: usize = 1;
-        while (level < kNumLevels) : (level += 1) {
+        for (1..kNumLevels) |level| {
             const index = findFile(self.vset.config.internal_comparator, self.files[level].items, key);
             if (index < self.files[level].items.len) {
                 const f = self.files[level].items[index];
@@ -409,8 +408,7 @@ pub const Version = struct {
 
     /// Append one table iterator per file; the caller merges them.
     pub fn addIterators(self: *Version, options: ReadOptions, list: *ArrayList(Iterator)) !void {
-        var level: usize = 0;
-        while (level < kNumLevels) : (level += 1) {
+        for (0..kNumLevels) |level| {
             for (self.files[level].items) |f| {
                 const it = try self.vset.table_cache.newIterator(options, f.number, f.file_size);
                 try list.append(self.gpa, it);
@@ -770,8 +768,7 @@ pub const VersionSet = struct {
     fn finalize(_: *VersionSet, v: *Version) void {
         var best_level: i32 = -1;
         var best_score: f64 = -1;
-        var level: usize = 0;
-        while (level + 1 < kNumLevels) : (level += 1) {
+        for (0..kNumLevels - 1) |level| {
             var score: f64 = undefined;
             if (level == 0) {
                 score = @as(f64, @floatFromInt(v.files[0].items.len)) / kL0_CompactionTrigger;
@@ -1204,8 +1201,7 @@ const Builder = struct {
         const gpa = self.gpa;
         const icmp = self.vset.config.internal_comparator;
 
-        var level: usize = 0;
-        while (level < kNumLevels) : (level += 1) {
+        for (0..kNumLevels) |level| {
             var merged = ArrayList(*FileMetaData).empty;
             defer merged.deinit(gpa);
 

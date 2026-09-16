@@ -16,30 +16,47 @@ const coding = @import("../primitives/coding.zig");
 const internal_key = @import("../db/internal_key.zig");
 const SequenceNumber = internal_key.SequenceNumber;
 
+// Record tags. These numbers are written to the MANIFEST, so they are part of
+// the on-disk format and must never change.
+/// Comparator name (length-prefixed string).
 pub const kComparator: u32 = 1;
+/// Current log file number (varint64).
 pub const kLogNumber: u32 = 2;
+/// Next file number to allocate (varint64).
 pub const kNextFileNumber: u32 = 3;
+/// Last used sequence number (varint64).
 pub const kLastSequence: u32 = 4;
+/// A level's compaction pointer: level (varint32) + internal key.
 pub const kCompactPointer: u32 = 5;
+/// A deleted file: level (varint32) + file number (varint64).
 pub const kDeletedFile: u32 = 6;
+/// A new file: level, number, size, smallest key, largest key.
 pub const kNewFile: u32 = 7;
+/// Previous log file number, kept for old manifests (varint64).
 pub const kPrevLogNumber: u32 = 9;
 
 /// Metadata for one table file. Internal keys are owned byte buffers.
 pub const FileMetaData = struct {
+    /// Reference count. Each `Version` that lists this file holds one.
     refs: u32 = 0,
     /// Seek budget; when it hits zero a seek-triggered compaction is scheduled.
     allowed_seeks: u32 = 1 << 30,
+    /// File number; also the `.sst` name.
     number: u64 = 0,
+    /// Size in bytes, as recorded when the table was written.
     file_size: u64 = 0,
+    /// Smallest internal key in the file (inclusive).
     smallest: ArrayList(u8) = .empty,
+    /// Largest internal key in the file (inclusive).
     largest: ArrayList(u8) = .empty,
 
+    /// Free the key buffers. Does not free the struct itself.
     pub fn deinit(self: *FileMetaData, gpa: Allocator) void {
         self.smallest.deinit(gpa);
         self.largest.deinit(gpa);
     }
 
+    /// Deep-copy the metadata, including its key buffers.
     pub fn clone(self: *const FileMetaData, gpa: Allocator) !FileMetaData {
         var m = FileMetaData{
             .refs = self.refs,
@@ -54,33 +71,56 @@ pub const FileMetaData = struct {
     }
 };
 
+/// A level's "resume point": the next compaction at `level` starts after `key`.
 pub const CompactPointer = struct { level: u32, key: ArrayList(u8) = .empty };
+/// A file removed from `level`.
 pub const DeletedFile = struct { level: u32, number: u64 };
+/// A file added at `level`, with its metadata.
 pub const NewFile = struct { level: u32, meta: FileMetaData };
 
+/// A delta to the set of live files and the DB's bookkeeping.
+///
+/// A `VersionEdit` is applied on top of the current `Version` to produce a new
+/// one. The MANIFEST is a log of these; recovery replays them in order.
+///
+/// Scalar fields (log number, sequence, ...) carry `has_*` flags because "not
+/// present" and "present and zero" are different: a compaction edit does not
+/// mention the sequence number, while the first edit after a fresh open does.
 pub const VersionEdit = struct {
+    /// Allocator for every buffer in the edit.
     gpa: Allocator,
 
+    /// Comparator name, if this edit sets it.
     comparator: ArrayList(u8) = .empty,
+    /// Log file number, if set.
     log_number: u64 = 0,
+    /// Previous log file number, if set.
     prev_log_number: u64 = 0,
+    /// Next file number, if set.
     next_file_number: u64 = 0,
+    /// Last sequence number, if set.
     last_sequence: SequenceNumber = 0,
 
+    /// Presence flags for the scalar fields above.
     has_comparator: bool = false,
     has_log_number: bool = false,
     has_prev_log_number: bool = false,
     has_next_file_number: bool = false,
     has_last_sequence: bool = false,
 
+    /// Updated compaction resume points.
     compact_pointers: ArrayList(CompactPointer) = .empty,
+    /// Files removed.
     deleted_files: ArrayList(DeletedFile) = .empty,
+    /// Files added.
     new_files: ArrayList(NewFile) = .empty,
 
+    /// Create an empty edit.
     pub fn init(gpa: Allocator) VersionEdit {
         return .{ .gpa = gpa };
     }
 
+    /// Free every owned buffer.
     pub fn deinit(self: *VersionEdit) void {
         const gpa = self.gpa;
         self.comparator.deinit(gpa);

@@ -32,22 +32,36 @@ pub const Options = struct {
     paranoid_checks: bool = false,
 };
 
+/// A read-only view of an open SSTable.
+///
+/// `open` reads the footer and the index block, and (if a filter policy is set)
+/// the filter block. Data blocks are read lazily as the iterator reaches them.
 pub const Table = struct {
+    /// Allocator for blocks and the table struct.
     gpa: Allocator,
+    /// Options used to open the table, including the comparator.
     options: Options,
+    /// The underlying file. Owned by the table.
     file: env_mod.RandomAccessFile,
+    /// Where the metaindex lives (used when there is no filter, and for
+    /// `approximateOffsetOf`).
     metaindex_handle: BlockHandle,
+    /// The decoded index block. Owned by the table.
     index_block: Block,
+    /// Bloom filter reader, if a filter block was found.
     filter: ?FilterBlockReader = null,
+    /// Owned bytes of the filter block (the reader borrows them).
     filter_data: ?[]u8 = null,
 
-    /// Takes ownership of `file` on success. On failure the caller still owns it.
+    /// Open a table. Takes ownership of `file` on success; on failure the
+    /// caller still owns it.
     pub fn open(
         gpa: Allocator,
         options: Options,
         file: env_mod.RandomAccessFile,
         file_size: u64,
     ) Error!*Table {
+        // The footer is the last 48 bytes; a smaller file cannot be a table.
         if (file_size < Footer.encoded_length) return error.Corruption;
 
         var footer_buf: [Footer.encoded_length]u8 = undefined;
@@ -57,6 +71,7 @@ pub const Table = struct {
         var input: []const u8 = n;
         const footer = try Footer.decodeFrom(&input);
 
+        // The index block is always read at open; data blocks are not.
         const read_opts = ReadOptions{ .verify_checksums = options.paranoid_checks };
         const index_contents = try format.readBlock(gpa, file, read_opts, footer.index_handle);
         const index_block = Block.init(gpa, index_contents.data);
@@ -70,10 +85,13 @@ pub const Table = struct {
             .index_block = index_block,
         };
 
+        // Filters are optional; failures here are non-fatal (see readMeta).
         try self.readMeta(footer);
         return self;
     }
 
+    /// Close the file and free the index and filter. Iterators that borrow
+    /// blocks from this table must be destroyed first.
     pub fn deinit(self: *Table) void {
         self.index_block.deinit();
         if (self.filter_data) |d| self.gpa.free(d);

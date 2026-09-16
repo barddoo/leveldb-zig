@@ -14,23 +14,38 @@ const ArrayList = std.ArrayList;
 const internal_key = @import("internal_key.zig");
 const SequenceNumber = internal_key.SequenceNumber;
 
+/// An opaque handle to a point in time. Reads with this snapshot see exactly
+/// the writes with a sequence number at or below `sequence`, and no later ones.
 pub const Snapshot = struct {
+    /// The sequence number the snapshot is pinned to.
     sequence: SequenceNumber,
 };
 
+/// The set of live snapshots. Compaction consults `oldest` to decide which
+/// older versions are safe to drop.
+///
+/// LevelDB keeps an intrusive sorted list; this port keeps an array and scans
+/// it. Snapshots are rare, so the O(n) scan is not worth optimizing away, and
+/// the array is much easier to read.
 pub const SnapshotList = struct {
+    /// Allocator used to create and destroy snapshots.
     gpa: Allocator,
+    /// Live snapshots, in creation order. Each is individually heap-allocated
+    /// so the pointer handed to the caller stays valid.
     items: ArrayList(*Snapshot) = .empty,
 
     pub fn init(gpa: Allocator) SnapshotList {
         return .{ .gpa = gpa };
     }
 
+    /// Free every snapshot. The DB calls this at close.
     pub fn deinit(self: *SnapshotList) void {
         for (self.items.items) |s| self.gpa.destroy(s);
         self.items.deinit(self.gpa);
     }
 
+    /// Pin the current sequence and return a handle. The caller must eventually
+    /// call `delete` with the same pointer.
     pub fn new(self: *SnapshotList, sequence: SequenceNumber) !*Snapshot {
         const s = try self.gpa.create(Snapshot);
         s.* = .{ .sequence = sequence };
@@ -38,6 +53,8 @@ pub const SnapshotList = struct {
         return s;
     }
 
+    /// Release a snapshot created by `new`. Panics if the pointer is unknown,
+    /// which means the caller released it twice or from the wrong DB.
     pub fn delete(self: *SnapshotList, snapshot: *Snapshot) void {
         for (self.items.items, 0..) |s, i| {
             if (s == snapshot) {
@@ -49,11 +66,13 @@ pub const SnapshotList = struct {
         unreachable; // snapshot was not created by this list
     }
 
+    /// True if no snapshots are live.
     pub fn isEmpty(self: *const SnapshotList) bool {
         return self.items.items.len == 0;
     }
 
-    /// Smallest sequence number among live snapshots, or null if none.
+    /// Smallest sequence number among live snapshots, or null if none. This is
+    /// the bound compaction uses when deciding what older data may be dropped.
     pub fn oldest(self: *const SnapshotList) ?SequenceNumber {
         var min: ?SequenceNumber = null;
         for (self.items.items) |s| {
@@ -62,6 +81,7 @@ pub const SnapshotList = struct {
         return min;
     }
 
+    /// Largest sequence number among live snapshots, or null if none.
     pub fn newest(self: *const SnapshotList) ?SequenceNumber {
         var max: ?SequenceNumber = null;
         for (self.items.items) |s| {

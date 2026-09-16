@@ -16,7 +16,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
-/// A decoded varint plus how many bytes it consumed.
+/// A decoded varint plus how many bytes it consumed. Returning the length lets
+/// callers advance a slice without re-scanning.
 pub const Varint32 = struct { value: u32, len: usize };
 pub const Varint64 = struct { value: u64, len: usize };
 
@@ -25,43 +26,26 @@ pub const Varint64 = struct { value: u64, len: usize };
 // ---------------------------------------------------------------------------
 
 /// Write a little-endian u32 into `dst[0..4]`. REQUIRES: `dst.len >= 4`.
+///
+/// `std.mem.writeInt` handles the byte order for us; `.little` is part of the
+/// on-disk format, so it must never change.
 pub fn encodeFixed32(dst: []u8, value: u32) void {
-    dst[0] = @truncate(value);
-    dst[1] = @truncate(value >> 8);
-    dst[2] = @truncate(value >> 16);
-    dst[3] = @truncate(value >> 24);
+    std.mem.writeInt(u32, dst[0..4], value, .little);
 }
 
 /// Write a little-endian u64 into `dst[0..8]`. REQUIRES: `dst.len >= 8`.
 pub fn encodeFixed64(dst: []u8, value: u64) void {
-    dst[0] = @truncate(value);
-    dst[1] = @truncate(value >> 8);
-    dst[2] = @truncate(value >> 16);
-    dst[3] = @truncate(value >> 24);
-    dst[4] = @truncate(value >> 32);
-    dst[5] = @truncate(value >> 40);
-    dst[6] = @truncate(value >> 48);
-    dst[7] = @truncate(value >> 56);
+    std.mem.writeInt(u64, dst[0..8], value, .little);
 }
 
 /// Read a little-endian u32 from `src[0..4]`. REQUIRES: `src.len >= 4`.
 pub fn decodeFixed32(src: []const u8) u32 {
-    return @as(u32, src[0]) |
-        (@as(u32, src[1]) << 8) |
-        (@as(u32, src[2]) << 16) |
-        (@as(u32, src[3]) << 24);
+    return std.mem.readInt(u32, src[0..4], .little);
 }
 
 /// Read a little-endian u64 from `src[0..8]`. REQUIRES: `src.len >= 8`.
 pub fn decodeFixed64(src: []const u8) u64 {
-    return @as(u64, src[0]) |
-        (@as(u64, src[1]) << 8) |
-        (@as(u64, src[2]) << 16) |
-        (@as(u64, src[3]) << 24) |
-        (@as(u64, src[4]) << 32) |
-        (@as(u64, src[5]) << 40) |
-        (@as(u64, src[6]) << 48) |
-        (@as(u64, src[7]) << 56);
+    return std.mem.readInt(u64, src[0..8], .little);
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +54,9 @@ pub fn decodeFixed64(src: []const u8) u64 {
 
 /// Encode `value` as a varint32 into `dst`; returns the number of bytes used.
 /// REQUIRES: `dst.len >= varintLength(value)` (max 5).
+///
+/// Seven bits per byte, least-significant group first; the high bit means
+/// "another byte follows".
 pub fn encodeVarint32(dst: []u8, value: u32) usize {
     var v = value;
     var i: usize = 0;
@@ -97,13 +84,11 @@ pub fn encodeVarint64(dst: []u8, value: u64) usize {
 }
 
 /// Decode a varint32 from the start of `src`, or null if it is truncated or
-/// would overflow 32 bits.
+/// would overflow 32 bits. At most five bytes are read.
 pub fn decodeVarint32(src: []const u8) ?Varint32 {
     var result: u32 = 0;
     var shift: u6 = 0;
-    var i: usize = 0;
-    while (i < src.len and i < 5) : (i += 1) {
-        const byte = src[i];
+    for (src[0..@min(src.len, 5)], 0..) |byte, i| {
         result |= @as(u32, byte & 0x7f) << @intCast(shift);
         if (byte < 0x80) return .{ .value = result, .len = i + 1 };
         shift += 7;
@@ -112,12 +97,11 @@ pub fn decodeVarint32(src: []const u8) ?Varint32 {
 }
 
 /// Decode a varint64 from the start of `src`, or null if truncated/overflow.
+/// At most ten bytes are read.
 pub fn decodeVarint64(src: []const u8) ?Varint64 {
     var result: u64 = 0;
     var shift: u7 = 0;
-    var i: usize = 0;
-    while (i < src.len and i < 10) : (i += 1) {
-        const byte = src[i];
+    for (src[0..@min(src.len, 10)], 0..) |byte, i| {
         result |= @as(u64, byte & 0x7f) << @intCast(shift);
         if (byte < 0x80) return .{ .value = result, .len = i + 1 };
         shift += 7;
@@ -125,7 +109,8 @@ pub fn decodeVarint64(src: []const u8) ?Varint64 {
     return null;
 }
 
-/// Number of bytes `value` occupies as a varint64.
+/// Number of bytes `value` occupies as a varint64. Used to size buffers before
+/// encoding.
 pub fn varintLength(value: u64) usize {
     var v = value;
     var n: usize = 1;
@@ -137,24 +122,28 @@ pub fn varintLength(value: u64) usize {
 // Appending helpers (used by the block builder and version-edit encoder)
 // ---------------------------------------------------------------------------
 
+/// Append a little-endian u32 to `list`.
 pub fn putFixed32(gpa: Allocator, list: *ArrayList(u8), value: u32) !void {
     var buf: [4]u8 = undefined;
     encodeFixed32(&buf, value);
     try list.appendSlice(gpa, &buf);
 }
 
+/// Append a little-endian u64 to `list`.
 pub fn putFixed64(gpa: Allocator, list: *ArrayList(u8), value: u64) !void {
     var buf: [8]u8 = undefined;
     encodeFixed64(&buf, value);
     try list.appendSlice(gpa, &buf);
 }
 
+/// Append a varint32 to `list`.
 pub fn putVarint32(gpa: Allocator, list: *ArrayList(u8), value: u32) !void {
     var buf: [5]u8 = undefined;
     const n = encodeVarint32(&buf, value);
     try list.appendSlice(gpa, buf[0..n]);
 }
 
+/// Append a varint64 to `list`.
 pub fn putVarint64(gpa: Allocator, list: *ArrayList(u8), value: u64) !void {
     var buf: [10]u8 = undefined;
     const n = encodeVarint64(&buf, value);
@@ -167,7 +156,8 @@ pub fn putLengthPrefixedSlice(gpa: Allocator, list: *ArrayList(u8), s: []const u
     try list.appendSlice(gpa, s);
 }
 
-/// Read a varint-length-prefixed slice from the front of `input`, advancing it.
+/// Read a varint-length-prefixed slice from the front of `input`, advancing
+/// `input` past it. Returns null if the length or the bytes are truncated.
 pub fn getLengthPrefixedSlice(input: *[]const u8) ?[]const u8 {
     const decoded = decodeVarint32(input.*) orelse return null;
     const rest = input.*[decoded.len..];

@@ -18,6 +18,16 @@ const iter_mod = @import("../iter/iterator.zig");
 const Iterator = iter_mod.Iterator;
 const TableCache = @import("table_cache.zig").TableCache;
 
+/// Write `iter`'s contents to a new table named after `meta.number`.
+///
+/// The iterator must yield internal keys in sorted order (it does — it is a
+/// memtable iterator or a compaction merge iterator). On success `meta` is
+/// updated with the file size and the smallest/largest keys seen. If the
+/// iterator is empty, no file is written and `meta.file_size` stays zero, which
+/// the caller treats as "nothing to install".
+///
+/// The table is reopened and scanned once at the end so a file that was written
+/// incorrectly is detected here rather than on a later read.
 pub fn buildTable(
     env: env_mod.Env,
     gpa: Allocator,

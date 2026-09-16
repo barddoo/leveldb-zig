@@ -29,6 +29,8 @@ pub const Reporter = struct {
     }
 };
 
+/// One physical record, tagged with how it relates to a logical record. `eof`
+/// and `bad` are reader-internal outcomes, not on-disk types.
 const Physical = union(enum) {
     full: []const u8,
     first: []const u8,
@@ -38,20 +40,42 @@ const Physical = union(enum) {
     bad,
 };
 
+/// Reads logical records from a log file, reassembling fragments and reporting
+/// corruption.
+///
+/// The reader keeps one block of bytes buffered. `buffer` is the unread part of
+/// that block; `end_of_buffer_offset` is how many bytes of the file have been
+/// read in total, which lets the reader compute the file offset of any record.
 pub const Reader = struct {
+    /// Allocator for the block buffer and fragment scratch space.
     gpa: Allocator,
+    /// Source file. Not owned; the caller closes it.
     file: SequentialFile,
+    /// Optional corruption sink. Null means "ignore corruption silently".
     reporter: ?Reporter,
+    /// Whether to verify each record's CRC. Recovery always enables this.
     verify_checksums: bool,
+    /// Fixed block-sized buffer that `file.read` fills.
     backing: []u8,
+    /// The not-yet-consumed portion of `backing`.
     buffer: []const u8 = &.{},
+    /// Reassembly buffer for fragmented records.
     scratch: ArrayList(u8) = .empty,
+    /// True once a short read has been seen; no more data is expected.
     eof: bool = false,
+    /// File offset of the last logical record returned.
     last_record_offset: u64 = 0,
+    /// Total bytes read from the file so far.
     end_of_buffer_offset: u64 = 0,
+    /// Skip records that begin before this offset. Used when appending to an
+    /// existing log.
     initial_offset: u64 = 0,
+    /// When true, drop fragments until a record boundary is found. Set when
+    /// starting mid-file (initial_offset > 0).
     resyncing: bool = false,
 
+    /// Create a reader over `file`. Takes ownership of nothing; the caller
+    /// keeps the file alive and closes it.
     pub fn init(
         gpa: Allocator,
         file: SequentialFile,
@@ -67,15 +91,19 @@ pub const Reader = struct {
             .verify_checksums = verify_checksums,
             .backing = backing,
             .initial_offset = initial_offset,
+            // Starting mid-file means the first fragments we see may be the
+            // tail of a record; resync until a start boundary.
             .resyncing = initial_offset > 0,
         };
     }
 
+    /// Free the block buffer and scratch space.
     pub fn deinit(self: *Reader) void {
         self.gpa.free(self.backing);
         self.scratch.deinit(self.gpa);
     }
 
+    /// File offset of the most recently returned logical record.
     pub fn lastRecordOffset(self: *const Reader) u64 {
         return self.last_record_offset;
     }

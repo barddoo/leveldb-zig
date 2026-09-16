@@ -20,18 +20,29 @@ const status = @import("status.zig");
 pub const Error = status.Error || Allocator.Error;
 
 pub const Comparator = struct {
+    /// Opaque context for the implementation (ignored by stateless comparators).
     ptr: *const anyopaque,
+    /// The function table. Every Comparator shares the same shape.
     vtable: *const VTable,
 
+    /// The operations a comparator must provide. This is the "interface"; an
+    /// implementation supplies these functions and a context pointer.
     pub const VTable = struct {
+        /// Three-way compare. Must be a total order.
         compare: *const fn (ctx: *const anyopaque, a: []const u8, b: []const u8) i32,
+        /// A stable name; stored in the MANIFEST so a comparator mismatch is
+        /// detected rather than silently corrupting the ordering.
         name: *const fn (ctx: *const anyopaque) []const u8,
+        /// Optionally shorten `start` to a shorter key that is still in
+        /// `[start, limit)`. Used to shrink index keys.
         findShortestSeparator: *const fn (
             ctx: *const anyopaque,
             gpa: Allocator,
             start: *ArrayList(u8),
             limit: []const u8,
         ) Error!void,
+        /// Optionally shorten `key` to a shorter key that is still >= `key`.
+        /// Used for the last index entry.
         findShortSuccessor: *const fn (
             ctx: *const anyopaque,
             gpa: Allocator,
@@ -49,6 +60,8 @@ pub const Comparator = struct {
         return self.vtable.name(self.ptr);
     }
 
+    /// Shorten `start` toward `limit`. `start` is an in/out buffer; a no-op
+    /// implementation is valid.
     pub fn findShortestSeparator(
         self: Comparator,
         gpa: Allocator,
@@ -58,6 +71,7 @@ pub const Comparator = struct {
         return self.vtable.findShortestSeparator(self.ptr, gpa, start, limit);
     }
 
+    /// Shorten `key`. `key` is an in/out buffer; a no-op implementation is valid.
     pub fn findShortSuccessor(self: Comparator, gpa: Allocator, key: *ArrayList(u8)) Error!void {
         return self.vtable.findShortSuccessor(self.ptr, gpa, key);
     }
@@ -67,12 +81,14 @@ pub const Comparator = struct {
 // Bytewise comparator
 // ---------------------------------------------------------------------------
 
+/// Name stored in the MANIFEST. Never change it for an existing comparator.
 const bytewise_name = "leveldb.BytewiseComparator";
 
 // The bytewise implementation needs no state, but the vtable requires a
 // context pointer, so we point at this dummy.
 const bytewise_ctx: u8 = 0;
 
+/// Lexicographic comparison of the raw bytes, shorter-is-smaller on a tie.
 fn bytewiseCompare(_: *const anyopaque, a: []const u8, b: []const u8) i32 {
     return switch (std.mem.order(u8, a, b)) {
         .lt => -1,
@@ -85,6 +101,10 @@ fn bytewiseName(_: *const anyopaque) []const u8 {
     return bytewise_name;
 }
 
+/// Shorten `start` by finding the first byte where it differs from `limit` and
+/// bumping it. For example `"abc1xyz"` with limit `"abc9"` becomes `"abc2"`.
+/// If one key is a prefix of the other, or the next byte cannot be bumped while
+/// staying below `limit`, the key is left unchanged.
 fn bytewiseFindShortestSeparator(
     _: *const anyopaque,
     gpa: Allocator,
@@ -100,12 +120,16 @@ fn bytewiseFindShortestSeparator(
     if (diff >= min_len) return; // one is a prefix of the other
 
     const diff_byte = start.items[diff];
+    // Only shorten if the bumped byte is still strictly below `limit`'s byte;
+    // otherwise the result could equal or exceed `limit`.
     if (diff_byte < 0xff and diff_byte + 1 < limit[diff]) {
         start.items[diff] += 1;
         start.items.len = diff + 1; // truncate
     }
 }
 
+/// Shorten `key` by bumping its first non-0xff byte. For example `"abc"`
+/// becomes `"b"`. All-0xff keys cannot be shortened and are left alone.
 fn bytewiseFindShortSuccessor(_: *const anyopaque, gpa: Allocator, key: *ArrayList(u8)) !void {
     _ = gpa;
     for (key.items, 0..) |byte, i| {
@@ -125,7 +149,8 @@ const bytewise_vtable = Comparator.VTable{
     .findShortSuccessor = bytewiseFindShortSuccessor,
 };
 
-/// The default lexicographic bytewise comparator.
+/// The default lexicographic bytewise comparator. Stateless, so a single
+/// instance is shared by the whole process.
 pub const bytewise: Comparator = .{
     .ptr = @as(*const anyopaque, @ptrCast(&bytewise_ctx)),
     .vtable = &bytewise_vtable,

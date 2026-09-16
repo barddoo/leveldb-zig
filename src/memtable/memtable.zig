@@ -36,6 +36,8 @@ fn entryInternalKey(entry: []const u8) []const u8 {
 }
 
 /// The skip list comparator: compare the internal-key portions of two entries.
+/// The skip list stores whole entry buffers, so we decode the length prefix to
+/// reach the internal key before comparing.
 pub const KeyComparator = struct {
     icmp: internal_key.InternalKeyComparator,
 
@@ -44,13 +46,25 @@ pub const KeyComparator = struct {
     }
 };
 
+/// The concrete skip list type used here: keys are entry buffers (byte slices).
 const Table = SkipList([]const u8, KeyComparator);
 
+/// The in-memory write buffer.
+///
+/// Entries live in `arena`; the skip list holds slices into it. `refs` is a
+/// reference count: the DB holds one reference for the active memtable and one
+/// for the immutable one being flushed, and each iterator that reads it takes
+/// another. The memtable is freed when the last reference goes away.
 pub const MemTable = struct {
+    /// Allocator for the struct itself (the entries use `arena`).
     gpa: Allocator,
+    /// Bump allocator holding every entry and skip-list node.
     arena: Arena,
+    /// Compares internal keys.
     icmp: internal_key.InternalKeyComparator,
+    /// Reference count; see the type comment.
     refs: u32,
+    /// Sorted index over the entries.
     table: Table,
 
     /// Allocate and initialize a memtable. Its initial refcount is zero; the
@@ -64,6 +78,9 @@ pub const MemTable = struct {
         errdefer self.arena.deinit();
         self.icmp = icmp;
         self.refs = 0;
+        // The skip list allocates its head node from the arena, so the arena
+        // must be initialized first. `self` is a stable heap pointer, so
+        // `&self.arena` stays valid for the list's lifetime.
         self.table = try Table.init(.{ .icmp = icmp }, &self.arena);
         return self;
     }
@@ -73,16 +90,20 @@ pub const MemTable = struct {
         self.gpa.destroy(self);
     }
 
+    /// Take a reference.
     pub fn ref(self: *MemTable) void {
         self.refs += 1;
     }
 
+    /// Drop a reference, freeing the memtable when it reaches zero.
     pub fn unref(self: *MemTable) void {
         std.debug.assert(self.refs > 0);
         self.refs -= 1;
         if (self.refs == 0) self.destroy();
     }
 
+    /// Bytes used by this memtable. The DB compares this against
+    /// `write_buffer_size` to decide when to flush.
     pub fn approximateMemoryUsage(self: *const MemTable) usize {
         return self.arena.memoryUsage();
     }

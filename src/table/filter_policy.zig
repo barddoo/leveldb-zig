@@ -19,39 +19,61 @@ const status = @import("../primitives/status.zig");
 /// Errors a filter operation may return (only allocation).
 pub const Error = status.Error || Allocator.Error;
 
+/// Summarizes a set of keys into a compact filter, and answers "might this key
+/// be in the set?".
+///
+/// A filter may return false positives but never false negatives: if
+/// `keyMayMatch` returns false, the key is definitely absent, so the table read
+/// can be skipped. That is the whole point — it saves disk reads.
 pub const FilterPolicy = struct {
+    /// Implementation state.
     ptr: *const anyopaque,
+    /// The function table.
     vtable: *const VTable,
 
+    /// The interface. Implementations fill these in and supply a context.
     pub const VTable = struct {
+        /// Name written into the table's metaindex, so a reader can tell which
+        /// policy produced a filter. Changing the filter encoding must change
+        /// this name.
         name: *const fn (ctx: *const anyopaque) []const u8,
-        /// Append a filter summarizing `keys` to `dst`.
+        /// Append a filter summarizing `keys` to `dst` (do not clear `dst`).
         createFilter: *const fn (
             ctx: *const anyopaque,
             gpa: Allocator,
             keys: []const []const u8,
             dst: *ArrayList(u8),
         ) Error!void,
+        /// False only if `key` is definitely not in the set that produced
+        /// `filter`.
         keyMayMatch: *const fn (ctx: *const anyopaque, key: []const u8, filter: []const u8) bool,
     };
 
+    /// The policy's name.
     pub fn name(self: FilterPolicy) []const u8 {
         return self.vtable.name(self.ptr);
     }
 
+    /// Append a filter for `keys`.
     pub fn createFilter(self: FilterPolicy, gpa: Allocator, keys: []const []const u8, dst: *ArrayList(u8)) Error!void {
         return self.vtable.createFilter(self.ptr, gpa, keys, dst);
     }
 
+    /// Whether `key` might be in the set summarized by `filter`.
     pub fn keyMayMatch(self: FilterPolicy, key: []const u8, filter: []const u8) bool {
         return self.vtable.keyMayMatch(self.ptr, key, filter);
     }
 };
 
+/// Name of the built-in Bloom filter. Part of the on-disk format: it appears in
+/// every table's metaindex when a filter is used.
 pub const bloom_name = "leveldb.BuiltinBloomFilter2";
 
+/// The built-in Bloom filter implementation.
 const Bloom = struct {
+    /// Target bits per key, chosen at creation.
     bits_per_key: usize,
+    /// Number of hash probes per key (~0.69 * bits_per_key, clamped to [1,30]).
     k: usize,
 
     fn policy(self: *const Bloom) FilterPolicy {
@@ -86,8 +108,7 @@ const Bloom = struct {
         for (keys) |key| {
             var h = hash.hash(key, 0xbc9f1d34);
             const delta = (h >> 17) | (h << 15);
-            var j: usize = 0;
-            while (j < self.k) : (j += 1) {
+            for (0..self.k) |_| {
                 const bitpos = h % bits;
                 dst.items[start + bitpos / 8] |= @as(u8, 1) << @intCast(bitpos % 8);
                 h +%= delta;
@@ -107,8 +128,7 @@ const Bloom = struct {
 
         var h = hash.hash(key, 0xbc9f1d34);
         const delta = (h >> 17) | (h << 15);
-        var j: usize = 0;
-        while (j < k) : (j += 1) {
+        for (0..k) |_| {
             const bitpos = h % bits;
             if (filter[bitpos / 8] & (@as(u8, 1) << @intCast(bitpos % 8)) == 0) return false;
             h +%= delta;

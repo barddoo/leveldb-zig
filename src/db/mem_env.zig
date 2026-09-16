@@ -11,22 +11,33 @@ const ArrayList = std.ArrayList;
 const env_mod = @import("env.zig");
 const Env = env_mod.Env;
 
+/// A file's contents. Heap-allocated and referenced by pointer so a writable
+/// handle stays valid even if the hash map is resized by a later file creation.
 const FileData = struct {
     data: ArrayList(u8) = .empty,
 };
 
+/// An `Env` whose files live in memory. Everything is a byte buffer; there is
+/// no real filesystem, so tests are fast and leave nothing behind.
 pub const MemEnv = struct {
+    /// Allocator for all maps, keys, file data, and handles.
     gpa: Allocator,
+    /// Open "files", keyed by path. Values are stable pointers (see FileData).
     files: std.StringHashMapUnmanaged(*FileData) = .empty,
+    /// Existing "directories". The DB only ever uses one, but the model is
+    /// general.
     dirs: std.StringHashMapUnmanaged(void) = .empty,
+    /// A fake monotonic clock; advances on each `nowMicros`/`sleepMicros`.
     clock: u64 = 0,
 
+    /// Create an empty environment. Free with `deinit`.
     pub fn init(gpa: Allocator) !*MemEnv {
         const self = try gpa.create(MemEnv);
         self.* = .{ .gpa = gpa };
         return self;
     }
 
+    /// Free every file, directory, and the environment itself.
     pub fn deinit(self: *MemEnv) void {
         const gpa = self.gpa;
         var it = self.files.iterator();
@@ -44,6 +55,7 @@ pub const MemEnv = struct {
         gpa.destroy(self);
     }
 
+    /// Wrap this environment in the `Env` vtable the engine uses.
     pub fn env(self: *MemEnv) Env {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -52,10 +64,12 @@ pub const MemEnv = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
+    /// Look up an existing file, or null.
     fn findFile(self: *MemEnv, path: []const u8) ?*FileData {
         return self.files.get(path);
     }
 
+    /// Look up a file, creating an empty one if it does not exist.
     fn ensureFile(self: *MemEnv, path: []const u8) !*FileData {
         if (self.files.get(path)) |f| return f;
         const key = try self.gpa.dupe(u8, path);

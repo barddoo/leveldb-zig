@@ -16,6 +16,8 @@ const IteratorWrapper = iter_mod.IteratorWrapper;
 const IteratorError = iter_mod.IteratorError;
 const ReadOptions = @import("../table/format.zig").ReadOptions;
 
+/// Produces a data iterator for the block named by an index entry. `arg` is
+/// the caller's context (for a table, the `*Table`).
 pub const BlockFunction = *const fn (
     arg: *anyopaque,
     gpa: Allocator,
@@ -23,16 +25,34 @@ pub const BlockFunction = *const fn (
     index_value: []const u8,
 ) IteratorError!Iterator;
 
+/// An iterator over an index whose entries point at blocks.
+///
+/// The index iterator yields `(separator_key, block_handle)` pairs. Whenever the
+/// index moves, `block_function` opens the named block and gives us a data
+/// iterator over it. Because both levels are sorted and non-overlapping, walking
+/// the data iterator and stepping the index when it is exhausted yields the
+/// blocks in order — exactly what a table scan needs.
 pub const TwoLevelIterator = struct {
+    /// Allocator for the data iterators and the cached handle.
     gpa: Allocator,
+    /// Opens a block given an index value.
     block_function: BlockFunction,
+    /// Passed through to `block_function`.
     arg: *anyopaque,
+    /// Read options for block reads.
     options: ReadOptions,
+    /// Iterator over the index entries.
     index_iter: IteratorWrapper = .{},
+    /// Iterator over the current data block (null before the first seek).
     data_iter: IteratorWrapper = .{},
+    /// Copy of the index value for the currently open block, so we can tell
+    /// whether the index moved to a *different* block or just re-seeked within
+    /// the same one.
     data_block_handle: ArrayList(u8) = .empty,
+    /// First error seen; surfaced by `status()`.
     err: ?IteratorError = null,
 
+    /// Build a two-level iterator. Takes ownership of `index_iter`.
     pub fn create(
         gpa: Allocator,
         index_iter: Iterator,
@@ -55,10 +75,13 @@ pub const TwoLevelIterator = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
+    /// Remember the first error; later errors are dropped.
     fn saveError(self: *TwoLevelIterator, err: IteratorError) void {
         if (self.err == null) self.err = err;
     }
 
+    /// Replace the data iterator, releasing the old one and salvaging its
+    /// status first.
     fn setDataIterator(self: *TwoLevelIterator, new_iter: ?Iterator) void {
         if (self.data_iter.iter) |old| {
             old.status() catch |e| self.saveError(e);
@@ -67,6 +90,7 @@ pub const TwoLevelIterator = struct {
         self.data_iter.set(new_iter);
     }
 
+    /// Open the block the index currently points at, unless it is already open.
     fn initDataBlock(self: *TwoLevelIterator) void {
         if (!self.index_iter.valid()) {
             self.setDataIterator(null);

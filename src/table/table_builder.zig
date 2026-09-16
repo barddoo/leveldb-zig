@@ -26,27 +26,52 @@ const Footer = format.Footer;
 const FilterPolicy = @import("filter_policy.zig").FilterPolicy;
 const FilterBlockBuilder = @import("filter_block.zig").Builder;
 
+/// Knobs for building a table.
 pub const Options = struct {
+    /// Target uncompressed size of a data block. A block is flushed once its
+    /// estimate reaches this.
     block_size: usize = 4096,
+    /// Number of keys between restart points in data blocks.
     block_restart_interval: usize = 16,
+    /// Orders keys and supplies separator shortening for the index.
     comparator: comparator.Comparator,
+    /// If set, a filter block is written and recorded in the metaindex.
     filter_policy: ?FilterPolicy = null,
 };
 
+/// Writes an SSTable.
+///
+/// `add` appends entries to the current data block. When the block is full it is
+/// written to the file and its handle is recorded in the index block. `finish`
+/// writes the filter, metaindex, index, and footer.
 pub const TableBuilder = struct {
+    /// Allocator for block builders and the filter.
     gpa: Allocator,
+    /// Configuration captured at construction.
     options: Options,
+    /// Destination file. Not owned; the caller closes it.
     file: WritableFile,
+    /// Bytes written so far, used for block handles and `fileSize`.
     offset: u64 = 0,
+    /// Current data block being filled.
     data_block: BlockBuilder,
+    /// Index block: one entry per data block, built incrementally.
     index_block: BlockBuilder,
+    /// The last key added, needed to build the next index entry.
     last_key: ArrayList(u8) = .empty,
+    /// Total entries added.
     num_entries: u64 = 0,
+    /// Set by `finish` or `abandon`; guards against further writes.
     closed: bool = false,
+    /// Accumulates Bloom filters, if a policy was configured.
     filter_block: ?FilterBlockBuilder = null,
+    /// True when the previous data block was flushed and the next `add` must
+    /// first record an index entry for it.
     pending_index_entry: bool = false,
+    /// Handle of the most recently flushed data block.
     pending_handle: BlockHandle = .{},
 
+    /// Create a builder writing to `file`.
     pub fn init(gpa: Allocator, options: Options, file: WritableFile) !TableBuilder {
         var data_block = try BlockBuilder.init(gpa, options.block_restart_interval);
         errdefer data_block.deinit();
@@ -70,6 +95,7 @@ pub const TableBuilder = struct {
         };
     }
 
+    /// Free builder state. Does not close the file.
     pub fn deinit(self: *TableBuilder) void {
         self.data_block.deinit();
         self.index_block.deinit();
@@ -77,6 +103,7 @@ pub const TableBuilder = struct {
         if (self.filter_block) |*fb| fb.deinit();
     }
 
+    /// Number of entries written so far.
     pub fn numEntries(self: *const TableBuilder) u64 {
         return self.num_entries;
     }

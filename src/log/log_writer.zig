@@ -13,10 +13,21 @@ const log_format = @import("log_format.zig");
 const WritableFile = @import("../db/env.zig").WritableFile;
 const Error = @import("../db/env.zig").Error;
 
+/// Appends logical records to a log file.
+///
+/// A logical record may be split across several physical records so it never
+/// crosses a block boundary. The writer tracks how far into the current block
+/// it has written, so it can pad the trailer and start a fresh block when only
+/// a few bytes remain.
 pub const Writer = struct {
+    /// Destination file. Not owned; the caller closes it.
     dest: WritableFile,
+    /// Bytes already written into the current 32 KiB block. Always less than
+    /// `block_size`; reset to 0 at each block boundary.
     block_offset: usize,
 
+    /// Create a writer. `dest_length` is the current file size, so appending to
+    /// an existing file resumes at the right block offset.
     pub fn init(dest: WritableFile, dest_length: u64) Writer {
         return .{
             .dest = dest,
@@ -24,20 +35,26 @@ pub const Writer = struct {
         };
     }
 
+    /// Durably persist everything appended so far.
     pub fn sync(self: *Writer) Error!void {
         try self.dest.sync();
     }
 
+    /// Push buffered bytes to the OS (not necessarily durable).
     pub fn flush(self: *Writer) Error!void {
         try self.dest.flush();
     }
 
+    /// Append one logical record, fragmenting it across blocks as needed.
     pub fn addRecord(self: *Writer, data: []const u8) Error!void {
         var ptr = data;
         var begin = true;
 
         // Loop at least once so an empty record still emits a FULL record.
         while (true) {
+            // If fewer than a header's worth of bytes remain in the block, pad
+            // the rest with zeros and move to a fresh block. A record never
+            // starts inside the final 7 bytes.
             const leftover = log_format.block_size - self.block_offset;
             if (leftover < log_format.header_size) {
                 if (leftover > 0) {
@@ -47,10 +64,13 @@ pub const Writer = struct {
                 self.block_offset = 0;
             }
 
+            // How much of the record fits after this block's header.
             const avail = log_format.block_size - self.block_offset - log_format.header_size;
             const fragment_length = @min(ptr.len, avail);
             const end = ptr.len == fragment_length;
 
+            // FIRST/MIDDLE/LAST/FULL is determined by whether this fragment is
+            // the start and/or end of the logical record.
             const record_type: log_format.RecordType = if (begin and end)
                 .full
             else if (begin)
@@ -68,6 +88,7 @@ pub const Writer = struct {
         }
     }
 
+    /// Write one physical record: header (crc, length, type) then payload.
     fn emitPhysicalRecord(self: *Writer, record_type: log_format.RecordType, data: []const u8) Error!void {
         std.debug.assert(data.len <= 0xffff);
         std.debug.assert(self.block_offset + log_format.header_size + data.len <= log_format.block_size);
@@ -85,6 +106,7 @@ pub const Writer = struct {
 
         try self.dest.append(&header);
         try self.dest.append(data);
+        // Flush after each record so a reader always sees whole records.
         try self.dest.flush();
 
         self.block_offset += log_format.header_size + data.len;

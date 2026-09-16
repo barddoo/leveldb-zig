@@ -8,13 +8,26 @@
 const std = @import("std");
 const coding = @import("coding.zig");
 
+/// Hash `data` with `seed`. The same bytes and seed always give the same value,
+/// so bloom filters and cache keys are reproducible across runs.
+///
+/// The seed lets one function serve many purposes: the bloom filter uses a
+/// fixed seed, and a cache can mix an id into the seed to partition its key
+/// space.
 pub fn hash(data: []const u8, seed: u32) u32 {
+    // Mixing constant and the shift used for the trailing bytes. Both are
+    // arbitrary primes/shifts chosen for good avalanche; they are part of the
+    // format only in the sense that changing them changes bloom filter bytes.
     const m: u32 = 0xc6a4_a793;
     const r: u32 = 24;
 
+    // Fold the length into the seed so that `"ab"` and `"ba"` differ even
+    // before processing bytes.
     var h: u32 = seed ^ (@as(u32, @intCast(data.len)) *% m);
     var p = data;
 
+    // Consume four bytes at a time. Each round adds a word, multiplies, and
+    // folds the high half back down.
     while (p.len >= 4) {
         h +%= coding.decodeFixed32(p);
         p = p[4..];
@@ -23,7 +36,8 @@ pub fn hash(data: []const u8, seed: u32) u32 {
     }
 
     // Handle the 1-3 trailing bytes. The C++ version uses switch fallthrough;
-    // this spells each case out for clarity.
+    // this spells each case out for clarity. Note the tail is added low byte
+    // first, then mixed once.
     switch (p.len) {
         3 => {
             h +%= @as(u32, p[2]) << 16;

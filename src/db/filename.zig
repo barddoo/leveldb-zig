@@ -18,50 +18,70 @@ const Allocator = std.mem.Allocator;
 const env_mod = @import("env.zig");
 const Env = env_mod.Env;
 
+/// The kinds of files that live in a DB directory. The type determines how the
+/// file is treated during cleanup.
 pub const FileType = enum {
+    /// Write-ahead log. Only the current (and previous) log are kept.
     log,
+    /// The `LOCK` file, held for the lifetime of an open DB.
     lock,
+    /// Sorted table (`.sst`). Kept while referenced by a live version.
     table,
+    /// `MANIFEST-*`. Older manifests are deleted once superseded.
     descriptor,
+    /// The `CURRENT` text file naming the live MANIFEST.
     current,
+    /// Temporary file used when installing `CURRENT`.
     temp,
+    /// `LOG` / `LOG.old` informational logs.
     info_log,
 };
 
+/// Path of a log file: `<db>/000123.log`.
 pub fn logFileName(gpa: Allocator, dbname: []const u8, number: u64) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/{d:0>6}.log", .{ dbname, number });
 }
 
+/// Path of a table file: `<db>/000123.sst`.
 pub fn tableFileName(gpa: Allocator, dbname: []const u8, number: u64) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/{d:0>6}.sst", .{ dbname, number });
 }
 
+/// Path of a MANIFEST: `<db>/MANIFEST-000123`.
 pub fn descriptorFileName(gpa: Allocator, dbname: []const u8, number: u64) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/MANIFEST-{d:0>6}", .{ dbname, number });
 }
 
+/// Path of `CURRENT`.
 pub fn currentFileName(gpa: Allocator, dbname: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/CURRENT", .{dbname});
 }
 
+/// Path of the lock file.
 pub fn lockFileName(gpa: Allocator, dbname: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/LOCK", .{dbname});
 }
 
+/// Path of a temporary file: `<db>/000123.dbtmp`.
 pub fn tempFileName(gpa: Allocator, dbname: []const u8, number: u64) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/{d:0>6}.dbtmp", .{ dbname, number });
 }
 
+/// Path of the current informational log.
 pub fn infoLogFileName(gpa: Allocator, dbname: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/LOG", .{dbname});
 }
 
+/// Path of the rotated informational log.
 pub fn oldInfoLogFileName(gpa: Allocator, dbname: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/LOG.old", .{dbname});
 }
 
+/// A file name decoded into its type and (for numbered files) its number.
 pub const Parsed = struct {
+    /// The file's number, or 0 for files without one.
     number: u64,
+    /// What kind of file it is.
     type: FileType,
 };
 

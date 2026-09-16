@@ -15,15 +15,29 @@ const ArrayList = std.ArrayList;
 
 const coding = @import("../primitives/coding.zig");
 
+/// Builds one prefix-compressed block.
+///
+/// Keys must be added in strictly increasing order. The first key at each
+/// restart point is stored in full; other keys store only the bytes they do not
+/// share with the previous key. The restart offsets are appended at the end so
+/// a reader can binary-search.
 pub const BlockBuilder = struct {
+    /// Allocator for the buffers.
     gpa: Allocator,
+    /// Number of entries between restart points (1 means every entry).
     restart_interval: usize,
+    /// Encoded entries, growing as keys are added.
     buffer: ArrayList(u8) = .empty,
+    /// Offsets of restart points within `buffer`; starts with 0.
     restarts: ArrayList(u32) = .empty,
+    /// Entries since the last restart point.
     counter: usize = 0,
+    /// Set by `finish`; guards against adding after finishing.
     finished: bool = false,
+    /// The previous key, used to compute the shared prefix.
     last_key: ArrayList(u8) = .empty,
 
+    /// Create a builder. `restart_interval` must be at least 1.
     pub fn init(gpa: Allocator, restart_interval: usize) !BlockBuilder {
         std.debug.assert(restart_interval >= 1);
         var restarts = ArrayList(u32).empty;
@@ -36,12 +50,15 @@ pub const BlockBuilder = struct {
         };
     }
 
+    /// Free the buffers.
     pub fn deinit(self: *BlockBuilder) void {
         self.buffer.deinit(self.gpa);
         self.restarts.deinit(self.gpa);
         self.last_key.deinit(self.gpa);
     }
 
+    /// Start a fresh block, keeping the allocations. Used to reuse one builder
+    /// for many blocks.
     pub fn reset(self: *BlockBuilder) void {
         self.buffer.clearRetainingCapacity();
         self.restarts.clearRetainingCapacity();
@@ -51,6 +68,7 @@ pub const BlockBuilder = struct {
         self.last_key.clearRetainingCapacity();
     }
 
+    /// True if no entries have been added since the last `reset`.
     pub fn isEmpty(self: *const BlockBuilder) bool {
         return self.buffer.items.len == 0;
     }

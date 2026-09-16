@@ -22,10 +22,18 @@ fn toEnvError(e: anyerror) Error {
     };
 }
 
+/// A real filesystem `Env` built on `std.Io`. This is what the CLI uses.
+///
+/// Paths are relative to the process working directory. Writes are positional
+/// (the handle tracks its own offset), which maps cleanly onto the log writer's
+/// append-then-flush pattern and avoids relying on file position.
 pub const IoEnv = struct {
+    /// Allocator for handles and the env itself.
     gpa: Allocator,
+    /// The I/O implementation supplied by `main`.
     io: Io,
 
+    /// Create the environment. Free with `deinit`.
     pub fn init(gpa: Allocator, io: Io) !*IoEnv {
         const self = try gpa.create(IoEnv);
         self.* = .{ .gpa = gpa, .io = io };
@@ -36,6 +44,7 @@ pub const IoEnv = struct {
         self.gpa.destroy(self);
     }
 
+    /// Wrap this environment in the `Env` vtable.
     pub fn env(self: *IoEnv) Env {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -49,13 +58,17 @@ pub const IoEnv = struct {
 // Handles
 // ---------------------------------------------------------------------------
 
+/// State behind a `WritableFile`: the open file plus how many bytes have been
+/// written (the offset for the next positional write).
 const WritableHandle = struct {
     io: Io,
     file: Io.File,
     offset: u64 = 0,
+    /// Set once `close` has run so `deinit` does not close twice.
     closed: bool = false,
 };
 
+/// State behind a `SequentialFile`: the open file plus the read position.
 const SequentialHandle = struct {
     io: Io,
     file: Io.File,

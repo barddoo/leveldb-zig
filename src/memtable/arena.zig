@@ -15,23 +15,42 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
 /// Alignment guaranteed by the backing allocator; the skiplist needs pointers.
+/// Guaranteed alignment for arena allocations; enough for the skip list's
+/// atomic pointers.
 pub const alignment = @alignOf(usize);
 
+/// A block handed out by the allocator. Stored so the arena can free them all
+/// at once in `deinit`.
 const Block = []align(alignment) u8;
 
+/// A bump allocator. Memory is handed out by advancing a pointer; nothing is
+/// freed individually. When the memtable that owns the arena goes away, the
+/// whole arena is dropped.
+///
+/// `memory_usage` counts the blocks requested from the backing allocator, so it
+/// is an upper bound on live data and is what the DB uses to decide when a
+/// memtable is full.
 pub const Arena = struct {
+    /// Backing allocator, used only when a new block is needed.
     gpa: Allocator,
+    /// Every block ever allocated. All are freed in `deinit`.
     blocks: ArrayList(Block) = .empty,
+    /// Next free byte in the current block.
     alloc_ptr: [*]u8 = undefined,
+    /// Bytes left in the current block.
     alloc_bytes_remaining: usize = 0,
+    /// Approximate bytes owned (block sizes plus bookkeeping).
     memory_usage: usize = 0,
 
+    /// Size of a normal block. Requests larger than a quarter of this get their
+    /// own dedicated block.
     pub const block_size = 4096;
 
     pub fn init(gpa: Allocator) Arena {
         return .{ .gpa = gpa };
     }
 
+    /// Free every block. Any slices returned by `allocate` become invalid.
     pub fn deinit(self: *Arena) void {
         for (self.blocks.items) |block| self.gpa.free(block);
         self.blocks.deinit(self.gpa);
@@ -42,7 +61,7 @@ pub const Arena = struct {
         return self.memory_usage;
     }
 
-    /// Allocate `bytes` with default alignment.
+    /// Allocate `bytes`. The result is valid until `deinit`.
     pub fn allocate(self: *Arena, bytes: usize) ![]u8 {
         if (bytes <= self.alloc_bytes_remaining) {
             const result = self.alloc_ptr[0..bytes];
@@ -53,6 +72,7 @@ pub const Arena = struct {
         return self.allocateFallback(bytes);
     }
 
+    /// Start a new block when the current one cannot satisfy a request.
     fn allocateFallback(self: *Arena, bytes: usize) ![]u8 {
         if (bytes > block_size / 4) {
             // Large request: dedicate a block to it so the current block's

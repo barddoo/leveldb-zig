@@ -19,15 +19,21 @@ const Iterator = iter_mod.Iterator;
 const IteratorError = iter_mod.IteratorError;
 
 pub const TableCache = struct {
+    /// Allocator for file handles and tables.
     gpa: Allocator,
+    /// Environment used to open table files.
     env: env_mod.Env,
+    /// Directory containing the DB. Borrowed; owned by the DB.
     dbname: []const u8,
+    /// Options passed to every opened table.
     table_options: table_mod.Options,
 
     pub fn init(gpa: Allocator, env: env_mod.Env, dbname: []const u8, options: table_mod.Options) TableCache {
         return .{ .gpa = gpa, .env = env, .dbname = dbname, .table_options = options };
     }
 
+    /// Open the table file for `number`. Caller owns the returned table and
+    /// must `deinit` it.
     fn openTable(self: *TableCache, number: u64, file_size: u64) env_mod.Error!*table_mod.Table {
         const fname = try filename.tableFileName(self.gpa, self.dbname, number);
         defer self.gpa.free(fname);
@@ -38,7 +44,8 @@ pub const TableCache = struct {
         return table_mod.Table.open(self.gpa, self.table_options, file, file_size);
     }
 
-    /// Look up `key` in the table for `number`.
+    /// Look up `key` in the table for `number`, invoking `handle_result` with
+    /// the first entry at or after it. The table is closed before returning.
     pub fn get(
         self: *TableCache,
         options: format.ReadOptions,
@@ -53,6 +60,8 @@ pub const TableCache = struct {
         try table.internalGet(self.gpa, options, key, arg, handle_result);
     }
 
+    /// Return an iterator over the table for `number`. The iterator owns the
+    /// open table, so the data stays valid until the iterator is deinited.
     pub fn newIterator(
         self: *TableCache,
         options: format.ReadOptions,

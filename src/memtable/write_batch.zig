@@ -25,12 +25,26 @@ const MemTable = @import("memtable.zig").MemTable;
 const ValueType = internal_key.ValueType;
 const SequenceNumber = internal_key.SequenceNumber;
 
+/// Bytes of batch header: an 8-byte sequence number plus a 4-byte record count.
 pub const header_size = 12;
 
+/// An atomic group of updates.
+///
+/// The serialized form is:
+///
+///     sequence : fixed64   // sequence of the first record
+///     count    : fixed32   // number of records
+///     record*             // tag, key[, value]
+///
+/// The whole buffer is appended to the WAL as one log record, so replaying a
+/// crash either applies all of it or none of it.
 pub const WriteBatch = struct {
+    /// The serialized bytes. Reused across operations; `clear` keeps capacity.
     rep: ArrayList(u8),
+    /// Allocator for `rep`.
     gpa: Allocator,
 
+    /// Create an empty batch (header only). Caller must `deinit`.
     pub fn init(gpa: Allocator) !WriteBatch {
         var rep = ArrayList(u8).empty;
         errdefer rep.deinit(gpa);
@@ -38,10 +52,12 @@ pub const WriteBatch = struct {
         return .{ .rep = rep, .gpa = gpa };
     }
 
+    /// Free the buffer.
     pub fn deinit(self: *WriteBatch) void {
         self.rep.deinit(self.gpa);
     }
 
+    /// Reset to an empty batch, keeping the allocation.
     pub fn clear(self: *WriteBatch) void {
         self.rep.items.len = header_size;
         @memset(self.rep.items, 0);
@@ -52,31 +68,39 @@ pub const WriteBatch = struct {
         return self.rep.items.len;
     }
 
-    /// LevelDB's rough "database change size" metric.
+    /// LevelDB's rough "database change size" metric. For this implementation
+    /// it is simply the serialized size.
     pub fn approximateSize(self: *const WriteBatch) usize {
         return self.rep.items.len;
     }
 
+    /// The serialized bytes, ready to append to the log.
     pub fn contents(self: *const WriteBatch) []const u8 {
         return self.rep.items;
     }
 
+    /// Number of records in the batch (stored in the header).
     pub fn count(self: *const WriteBatch) u32 {
         return coding.decodeFixed32(self.rep.items[8..12]);
     }
 
+    /// Overwrite the stored record count.
     pub fn setCount(self: *WriteBatch, n: u32) void {
         coding.encodeFixed32(self.rep.items[8..12], n);
     }
 
+    /// Sequence number of the first record (stored in the header).
     pub fn sequence(self: *const WriteBatch) SequenceNumber {
         return coding.decodeFixed64(self.rep.items[0..8]);
     }
 
+    /// Overwrite the stored sequence number. The DB sets this right before
+    /// applying the batch, assigning one sequence per record.
     pub fn setSequence(self: *WriteBatch, seq: SequenceNumber) void {
         coding.encodeFixed64(self.rep.items[0..8], seq);
     }
 
+    /// Append a put: tag, length-prefixed key, length-prefixed value.
     pub fn put(self: *WriteBatch, key: []const u8, value: []const u8) !void {
         self.setCount(self.count() + 1);
         try self.rep.append(self.gpa, @intFromEnum(ValueType.value));
@@ -84,6 +108,7 @@ pub const WriteBatch = struct {
         try coding.putLengthPrefixedSlice(self.gpa, &self.rep, value);
     }
 
+    /// Append a delete (tombstone): tag plus length-prefixed key.
     pub fn delete(self: *WriteBatch, key: []const u8) !void {
         self.setCount(self.count() + 1);
         try self.rep.append(self.gpa, @intFromEnum(ValueType.deletion));
@@ -91,7 +116,7 @@ pub const WriteBatch = struct {
     }
 
     /// Append all of `other`'s records after ours. The sequence number is left
-    /// untouched; the caller sets it before applying.
+    /// untouched; the caller sets it before applying. Used by group commit.
     pub fn append(self: *WriteBatch, other: *const WriteBatch) !void {
         self.setCount(self.count() + other.count());
         try self.rep.appendSlice(self.gpa, other.rep.items[header_size..]);
