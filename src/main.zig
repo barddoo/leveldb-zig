@@ -14,10 +14,14 @@ const leveldb = @import("leveldb");
 const DB = leveldb.DB;
 const IoEnv = leveldb.io_env.IoEnv;
 
+/// Entry point. Parses `<command> <db> [args...]`, opens the DB against the
+/// real filesystem, and dispatches. `sync = true` is used for writes so the CLI
+/// is durable by default (a human expects a `put` to survive).
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
 
+    // `init.minimal.args` holds the raw argv; skip argv[0] (the program name).
     var args = init.minimal.args.iterate();
     _ = args.next(); // argv[0]
 
@@ -31,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
         return usage(io);
     };
 
+    // The CLI always talks to real files, so use the std.Io-backed Env.
     const ioenv = try IoEnv.init(gpa, io);
     defer ioenv.deinit();
 

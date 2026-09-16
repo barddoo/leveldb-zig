@@ -99,13 +99,16 @@ pub const Table = struct {
         self.gpa.destroy(self);
     }
 
+    /// Return an iterator over the whole table. The index is traversed lazily;
+    /// each data block is read the first time the iterator enters it.
     pub fn newIterator(self: *Table, options: ReadOptions) IteratorError!Iterator {
         const index_iter = try self.index_block.newIterator(self.options.comparator);
         return TwoLevelIterator.create(self.gpa, index_iter, blockReader, self, options);
     }
 
-    /// Seek the index and, if the filter allows it, scan the target block,
-    /// invoking `handle_result` on the first entry at or after `key`.
+    /// Point lookup: seek the index, consult the filter, then scan the one
+    /// candidate data block, invoking `handle_result` on the first entry at or
+    /// after `key`. The caller's callback decides whether it matched.
     pub fn internalGet(
         self: *Table,
         gpa: Allocator,
@@ -117,6 +120,7 @@ pub const Table = struct {
         const iiter = try self.index_block.newIterator(self.options.comparator);
         defer iiter.deinit(gpa);
 
+        // Find the data block that could contain `key`.
         iiter.seek(key);
         if (!iiter.valid()) return;
 
@@ -124,6 +128,8 @@ pub const Table = struct {
         var hinput: []const u8 = handle_value;
         const handle = BlockHandle.decodeFrom(&hinput) catch return;
 
+        // The Bloom filter can rule out the block without reading it. This is
+        // the main payoff of storing filters.
         if (self.filter) |filter| {
             if (!filter.keyMayMatch(handle.offset, key)) return;
         }
@@ -136,6 +142,9 @@ pub const Table = struct {
         try block_iter.status();
     }
 
+    /// Approximate byte offset of `key` in the file, used for `GetApproximateSizes`.
+    /// Returns the start of the candidate data block, or the metaindex offset
+    /// if the key is past the end.
     pub fn approximateOffsetOf(self: *Table, gpa: Allocator, key: []const u8) u64 {
         const index_iter = self.index_block.newIterator(self.options.comparator) catch {
             return self.metaindex_handle.offset;
@@ -150,6 +159,9 @@ pub const Table = struct {
         return handle.offset;
     }
 
+    /// Read the metaindex and, if a filter policy is configured, load the
+    /// filter block. All failures here are ignored: a missing or corrupt filter
+    /// only costs performance, never correctness.
     fn readMeta(self: *Table, footer: Footer) Error!void {
         const policy = self.options.filter_policy orelse return;
 
