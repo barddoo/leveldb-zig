@@ -1,0 +1,9 @@
+{
+  // Recommended extensions for this workspace.
+  //   - ziglang.vscode-zig : language support + the `$zig` problem matcher
+  //   - vadimcn.vscode-lldb : the `lldb` debug type used by launch.json
+  "recommendations": [
+    "ziglang.vscode-zig",
+    "vadimcn.vscode-lldb"
+  ]
+}

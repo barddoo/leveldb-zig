@@ -1,0 +1,18 @@
+{
+  // Keep generated output out of search results.
+  "search.exclude": {
+    "**/.zig-cache": true,
+    "**/zig-out": true,
+    "**/zig-pkg": true
+  },
+  "files.watcherExclude": {
+    "**/.zig-cache/**": true,
+    "**/zig-out/**": true
+  },
+  // `zig fmt` on save (provided by ziglang.vscode-zig).
+  "[zig]": {
+    "editor.formatOnSave": true,
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4
+  }
+}

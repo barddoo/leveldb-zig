@@ -1,0 +1,17 @@
+.{
+    // `name` must be an enum literal (Zig 0.16 build.zig.zon rules), not a string.
+    .name = .leveldb_zig,
+    // Required since 0.16. Any random u64 uniquely identifies this package.
+    .fingerprint = 0x8c55f730ce83140b,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "docs",
+        "README.md",
+    },
+}

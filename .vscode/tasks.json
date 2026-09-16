@@ -1,0 +1,50 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "zig build",
+      "group": "build",
+      "problemMatcher": ["$zig"]
+    },
+    {
+      "label": "build-tests",
+      "detail": "Compile test executables (does not run them)",
+      "type": "shell",
+      "command": "zig build test-bin",
+      "group": "build",
+      "problemMatcher": ["$zig"]
+    },
+    {
+      "label": "build-tests-filtered",
+      "detail": "Compile only the tests matching the prompted substring",
+      "type": "shell",
+      "command": "zig build test-bin -Dtest-filter=\"${input:testFilter}\"",
+      "group": "build",
+      "problemMatcher": ["$zig"]
+    },
+    {
+      "label": "test",
+      "detail": "Run all unit and integration tests",
+      "type": "shell",
+      "command": "zig build test",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$zig"]
+    },
+    {
+      "label": "seed-demo-db",
+      "detail": "Create zig-out/debug-db with a few keys for CLI debugging",
+      "type": "shell",
+      "command": "rm -rf zig-out/debug-db && ./zig-out/bin/leveldb-zig put zig-out/debug-db alpha one && ./zig-out/bin/leveldb-zig put zig-out/debug-db beta two && ./zig-out/bin/leveldb-zig put zig-out/debug-db gamma three",
+      "dependsOn": ["build"],
+      "problemMatcher": []
+    },
+    {
+      "label": "fmt",
+      "type": "shell",
+      "command": "zig build fmt",
+      "problemMatcher": []
+    }
+  ]
+}

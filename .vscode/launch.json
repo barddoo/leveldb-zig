@@ -1,0 +1,83 @@
+{
+  // Debugging uses CodeLLDB (`vadimcn.vscode-lldb`). Zig emits DWARF, so
+  // breakpoints, stepping, and inspecting variables all work out of the box.
+  //
+  // The test binaries are produced by `zig build test-bin` and installed at
+  // predictable paths, because `zig build test` runs the tests in the same step
+  // and leaves nothing to attach to.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug: unit tests",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/leveldb-zig-tests",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["zig"],
+      "preLaunchTask": "build-tests"
+    },
+    {
+      "name": "Debug: unit tests (filtered)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/leveldb-zig-tests",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["zig"],
+      "preLaunchTask": "build-tests-filtered"
+    },
+    {
+      "name": "Debug: integration tests",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/leveldb-zig-integration-tests",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["zig"],
+      "preLaunchTask": "build-tests"
+    },
+    {
+      "name": "Debug: CLI (help)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/leveldb-zig",
+      "args": ["help"],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["zig"],
+      "preLaunchTask": "build"
+    },
+    {
+      "name": "Debug: CLI (scan demo db)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/leveldb-zig",
+      "args": ["scan", "${workspaceFolder}/zig-out/debug-db"],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["zig"],
+      "preLaunchTask": "seed-demo-db"
+    },
+    {
+      // Edit `args` to debug any command, e.g.
+      //   ["put", "zig-out/debug-db", "k", "v"]
+      //   ["get", "zig-out/debug-db", "alpha"]
+      //   ["compact", "zig-out/debug-db"]
+      "name": "Debug: CLI (custom args)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/zig-out/bin/leveldb-zig",
+      "args": ["help"],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["zig"],
+      "preLaunchTask": "build"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "testFilter",
+      "type": "promptString",
+      "description": "Test name substring to debug (e.g. \"compaction\", \"db put\")",
+      "default": "db put"
+    }
+  ]
+}
