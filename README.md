@@ -1,4 +1,4 @@
-# leveldb-zig
+# leveldb-zig (For learning purposes only)
 
 A from-scratch, learning-oriented LSM storage engine in Zig 0.16, closely
 modeled on Google's [LevelDB](https://github.com/google/leveldb).
