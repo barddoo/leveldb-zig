@@ -156,11 +156,18 @@ const GetStateEnum = enum { not_found, found, deleted, corrupt };
 pub const Version = struct {
     gpa: Allocator,
     vset: *VersionSet,
+    /// One sorted list of files per level. Levels 1..6 are disjoint (no two
+    /// files overlap); level 0 may overlap because its files are written by
+    /// separate memtable flushes.
     files: [kNumLevels]ArrayList(*FileMetaData) = [_]ArrayList(*FileMetaData){.empty} ** kNumLevels,
     refs: u32 = 0,
 
+    // Compaction bookkeeping, recomputed by `VersionSet.finalize`:
+    /// A file whose seek budget ran out and should be compacted.
     file_to_compact: ?*FileMetaData = null,
     file_to_compact_level: i32 = -1,
+    /// Highest size-based compaction score and the level it belongs to. A score
+    /// >= 1 means that level is over budget.
     compaction_score: f64 = -1,
     compaction_level: i32 = -1,
 
@@ -168,6 +175,11 @@ pub const Version = struct {
         self.refs += 1;
     }
 
+    /// Drop a reference. When the last one goes, free the file lists and drop a
+    /// reference to every file (which may free the file metadata too).
+    ///
+    /// Callers hold the DB mutex while dropping the final reference, because
+    /// this mutates the version set's list of live versions.
     pub fn unref(self: *Version) void {
         std.debug.assert(self.refs > 0);
         self.refs -= 1;
@@ -194,6 +206,15 @@ pub const Version = struct {
     }
 
     /// Look up `key` in this version, copying the value into `value`.
+    ///
+    /// Search order matters: newest data must win.
+    ///   1. Level 0 files overlap, so check every file whose range contains the
+    ///      key, newest file number first (the newest flush has the newest
+    ///      writes).
+    ///   2. Levels 1..6 are disjoint, so binary-search for the single file that
+    ///      could contain the key.
+    /// The first file that yields a match (value *or* tombstone) stops the
+    /// search, because newer data always hides older data.
     pub fn get(
         self: *Version,
         options: ReadOptions,
@@ -211,7 +232,8 @@ pub const Version = struct {
         var last_file_read_level: i32 = 0;
         var corrupt_err: ?Error = null;
 
-        // Level 0: files overlap, newest first.
+        // Level 0: files overlap, so collect every candidate and sort newest
+        // first.
         var l0 = ArrayList(*FileMetaData).empty;
         defer l0.deinit(self.gpa);
         for (self.files[0].items) |f| {
@@ -227,12 +249,15 @@ pub const Version = struct {
             if (!self.matchFile(&state, &last_file_read, &last_file_read_level, stats, 0, f, options, internal_key_bytes, user_key, value, &corrupt_err)) break;
         }
 
-        // Levels 1..6: files are disjoint, so binary search.
+        // Levels 1..6: files are disjoint, so one binary search finds the only
+        // candidate file.
         var level: usize = 1;
         while (level < kNumLevels and state == .not_found) : (level += 1) {
             const index = findFile(self.vset.config.internal_comparator, self.files[level].items, internal_key_bytes);
             if (index >= self.files[level].items.len) continue;
             const f = self.files[level].items[index];
+            // The file's largest key is >= our key, but its smallest may be
+            // greater, meaning the key falls in the gap before this file.
             if (ucmp.compare(user_key, internal_key.extractUserKey(f.smallest.items)) < 0) continue;
             if (!self.matchFile(&state, &last_file_read, &last_file_read_level, stats, @intCast(level), f, options, internal_key_bytes, user_key, value, &corrupt_err)) break;
         }
@@ -244,6 +269,9 @@ pub const Version = struct {
         }
     }
 
+    /// Receives the first matching internal key found in a table. The table
+    /// reader calls it with the entry at or after our lookup key; we check that
+    /// it is the right user key and record whether it is a value or tombstone.
     const Saver = struct {
         state: *GetStateEnum,
         user_key: []const u8,
@@ -258,9 +286,14 @@ pub const Version = struct {
                 s.state.* = .corrupt;
                 return;
             };
+            // A different user key means this table has no entry for us (the
+            // seek landed past our key); leave the state as not_found so the
+            // caller keeps looking in older files.
             if (s.ucmp.compare(parsed.user_key, s.user_key) == 0) {
                 if (parsed.type == .value) {
                     s.state.* = .found;
+                    // Copy the value: it points into the block, which is freed
+                    // when the table read returns.
                     s.value.clearRetainingCapacity();
                     s.value.appendSlice(s.gpa, raw_value) catch {
                         s.state.* = .corrupt;
@@ -273,6 +306,12 @@ pub const Version = struct {
         }
     };
 
+    /// Read one table and update `state`. Returns true to keep searching older
+    /// files, false to stop (found, deleted, or corrupt).
+    ///
+    /// Side effect: this is where the seek-budget heuristic lives. If a read has
+    /// already consulted one file and now needs a second, the *first* file is
+    /// blamed, because a good key layout would not have required the extra read.
     fn matchFile(
         self: *Version,
         state: *GetStateEnum,
@@ -312,6 +351,9 @@ pub const Version = struct {
         return state.* == .not_found;
     }
 
+    /// Decrement the seek budget of the file charged by the last read. When it
+    /// reaches zero, mark the file for a seek-triggered compaction and return
+    /// true so the caller can schedule one.
     pub fn updateStats(self: *Version, stats: GetStats) bool {
         if (stats.seek_file) |f| {
             if (f.allowed_seeks > 0) f.allowed_seeks -= 1;
@@ -519,11 +561,18 @@ pub const Compaction = struct {
         return self.max_output_file_size_;
     }
 
+    /// A "trivial move" is a compaction whose output would be exactly one of its
+    /// inputs. Rather than rewrite the file, we can just relink it into the next
+    /// level. This is safe only when the single input is at level > 0 (level 0
+    /// files may overlap each other) and when doing so would not overlap too
+    /// much of level+2 (the grandparents), which would make a future compaction
+    /// expensive.
     pub fn isTrivialMove(self: *const Compaction) bool {
         return self.inputs[0].len == 1 and self.inputs[1].len == 0 and
             totalFileSize(self.grandparents) <= maxGrandParentOverlapBytes(self.vset.config);
     }
 
+    /// Record in `edit` that every input file is being removed.
     pub fn addInputDeletions(self: *Compaction, edit: *VersionEdit) !void {
         for (0..2) |which| {
             for (self.inputs[which]) |f| {
@@ -533,6 +582,14 @@ pub const Compaction = struct {
     }
 
     /// True if no file at level+2 or deeper contains `user_key`.
+    ///
+    /// This decides whether a tombstone can be dropped. A tombstone must be kept
+    /// while older data for the same key might still exist in a deeper level; if
+    /// nothing is deeper, the tombstone has done its job and can go.
+    ///
+    /// `level_ptrs[lvl]` is a per-level cursor. Because the compaction walks keys
+    /// in ascending order, each level is only ever scanned forward, so this is
+    /// O(files) overall rather than O(files) per key.
     pub fn isBaseLevelForKey(self: *Compaction, user_key: []const u8) bool {
         const ucmp = self.vset.config.internal_comparator.user;
         var lvl: usize = @as(usize, self.level_) + 2;
@@ -540,11 +597,13 @@ pub const Compaction = struct {
             const files = self.input_version.files[lvl].items;
             while (self.level_ptrs[lvl] < files.len) {
                 const f = files[self.level_ptrs[lvl]];
+                // Files are sorted by smallest key. If this file's largest is
+                // before our key, skip it.
                 if (ucmp.compare(user_key, internal_key.extractUserKey(f.largest.items)) <= 0) {
                     if (ucmp.compare(user_key, internal_key.extractUserKey(f.smallest.items)) >= 0) {
                         return false; // key exists deeper
                     }
-                    break;
+                    break; // key falls in the gap before this file
                 }
                 self.level_ptrs[lvl] += 1;
             }
@@ -554,13 +613,18 @@ pub const Compaction = struct {
 
     /// True when the current output file has grown enough to risk overlapping
     /// too much of level+2; the caller should start a new output file.
+    ///
+    /// This bounds how much of level+2 a future compaction of this output would
+    /// have to merge, keeping compaction cost predictable.
     pub fn shouldStopBefore(self: *Compaction, internal_key_bytes: []const u8) bool {
+        // Advance past grandparents that end before the current key.
         while (self.grandparent_index < self.grandparents.len and
             self.vset.config.internal_comparator.compare(internal_key_bytes, self.grandparents[self.grandparent_index].largest.items) > 0)
         {
             self.grandparent_index += 1;
         }
         if (self.grandparent_index < self.grandparents.len) {
+            // Count the size of each grandparent the output touches, once.
             if (self.seen_key) self.overlapped_bytes += self.grandparents[self.grandparent_index].file_size;
             if (self.overlapped_bytes > maxGrandParentOverlapBytes(self.vset.config)) {
                 self.overlapped_bytes = 0;
@@ -571,6 +635,9 @@ pub const Compaction = struct {
         return false;
     }
 
+    /// Drop the reference to the version this compaction reads from. Idempotent,
+    /// because it may be called both after a successful compaction and from
+    /// `deinit`.
     pub fn releaseInputs(self: *Compaction) void {
         if (!self.inputs_released) {
             self.input_version.unref();
@@ -721,10 +788,23 @@ pub const VersionSet = struct {
     }
 
     /// Persist `edit` to the MANIFEST and install the resulting version.
+    ///
+    /// This is the only way the set of live files changes. Ordering matters:
+    ///   1. build the new version in memory,
+    ///   2. append the edit to the MANIFEST and fsync it,
+    ///   3. only then make the new version current.
+    /// If we crashed between 2 and 3, recovery would replay the edit and reach
+    /// the same state. If we made the version current before the MANIFEST write,
+    /// a crash could lose files that reads already depended on.
+    ///
+    /// The first call also creates the MANIFEST: it writes a snapshot of the
+    /// current version, then appends the edit, then atomically points CURRENT at
+    /// it. Callers must hold the DB mutex and must not call this concurrently.
     pub fn logAndApply(self: *VersionSet, edit: *VersionEdit) Error!void {
         const gpa = self.gpa;
 
-        // Normalize the edit with the set's current bookkeeping.
+        // Fill in the bookkeeping fields the edit did not set, so every
+        // MANIFEST record carries a complete picture.
         if (!edit.has_log_number) edit.setLogNumber(self.log_number);
         if (!edit.has_prev_log_number) edit.setPrevLogNumber(self.prev_log_number);
         edit.setNextFile(self.next_file_number);
@@ -738,7 +818,7 @@ pub const VersionSet = struct {
         defer builder.deinit();
         try builder.apply(edit);
         try builder.saveTo(v);
-        self.finalize(v);
+        self.finalize(v); // recompute compaction scores
 
         var created_manifest = false;
         if (self.descriptor_log == null) {
@@ -751,13 +831,14 @@ pub const VersionSet = struct {
             try self.writeSnapshot(&self.descriptor_log.?);
         }
 
-        // Append the edit and sync.
+        // Append the edit and make it durable before switching versions.
         var record = ArrayList(u8).empty;
         defer record.deinit(gpa);
         try edit.encodeTo(&record);
         try self.descriptor_log.?.addRecord(record.items);
         try self.descriptor_file.?.sync();
         if (created_manifest) {
+            // Atomic: write a temp file, sync, rename over CURRENT.
             try filename.setCurrentFile(self.env, gpa, self.dbname, self.manifest_file_number);
         }
 
@@ -766,6 +847,8 @@ pub const VersionSet = struct {
         self.prev_log_number = edit.prev_log_number;
     }
 
+    /// Write the entire current state as a single VersionEdit. A new MANIFEST
+    /// starts with this so recovery does not need every historical edit.
     fn writeSnapshot(self: *VersionSet, writer: *log.writer.Writer) Error!void {
         const gpa = self.gpa;
         var edit = VersionEdit.init(gpa);
@@ -788,6 +871,11 @@ pub const VersionSet = struct {
     }
 
     /// Reconstruct the current version from CURRENT and the MANIFEST.
+    ///
+    /// The MANIFEST is replayed from the beginning through one Builder, so the
+    /// snapshot and every subsequent edit compose into the final version. A few
+    /// fields (next file number, log number, last sequence) must have been seen
+    /// at least once or the DB is considered corrupt.
     pub fn recover(self: *VersionSet, save_manifest: *bool) Error!void {
         const gpa = self.gpa;
 
@@ -864,6 +952,17 @@ pub const VersionSet = struct {
         save_manifest.* = true;
     }
 
+    /// Choose a compaction to run, or null if none is needed.
+    ///
+    /// Two triggers, in priority order:
+    ///   * **size** — a level is over its byte budget (`compaction_score >= 1`).
+    ///     Files are picked round-robin: the first file that starts after the
+    ///     level's last compaction pointer, wrapping around.
+    ///   * **seek** — a file's seek budget ran out, meaning reads keep touching
+    ///     it and an older file (see `Version.matchFile`).
+    ///
+    /// Either way, `setupOtherInputs` then adds the overlapping files one level
+    /// down, so the compaction merges everything the key range can collide with.
     pub fn pickCompaction(self: *VersionSet) Error!?*Compaction {
         const v = self.currentVersion();
         const size_compaction = v.compaction_score >= 1;
@@ -877,6 +976,7 @@ pub const VersionSet = struct {
             c = try Compaction.create(self.gpa, self, level, v);
             errdefer c.deinit();
 
+            // Rotate through the level's key space using compact_pointer.
             const files = v.files[level].items;
             var chosen: ?*FileMetaData = null;
             for (files) |f| {
@@ -887,7 +987,7 @@ pub const VersionSet = struct {
                     break;
                 }
             }
-            if (chosen == null and files.len > 0) chosen = files[0];
+            if (chosen == null and files.len > 0) chosen = files[0]; // wrap around
             if (chosen == null) {
                 c.deinit();
                 return null;
@@ -903,7 +1003,8 @@ pub const VersionSet = struct {
         }
 
         if (level == 0) {
-            // Expand to every overlapping level-0 file.
+            // Level 0 files overlap, so a compaction must include every file
+            // that shares any key range with the chosen one.
             const range = self.getRange(c.inputs[0]);
             var expanded = ArrayList(*FileMetaData).empty;
             defer expanded.deinit(self.gpa);
@@ -918,6 +1019,7 @@ pub const VersionSet = struct {
         return c;
     }
 
+    /// Build a compaction over an explicit key range, for `CompactRange`.
     pub fn compactRange(self: *VersionSet, level: u32, begin: ?[]const u8, end: ?[]const u8) Error!?*Compaction {
         const v = self.currentVersion();
         var inputs = ArrayList(*FileMetaData).empty;
@@ -934,6 +1036,7 @@ pub const VersionSet = struct {
 
     const Range = struct { smallest: []const u8, largest: []const u8 };
 
+    /// The smallest and largest internal key across `files`.
     fn getRange(self: *VersionSet, files: []*FileMetaData) Range {
         const icmp = self.config.internal_comparator;
         var smallest = files[0].smallest.items;
@@ -960,6 +1063,12 @@ pub const VersionSet = struct {
         return .{ .smallest = smallest, .largest = largest };
     }
 
+    /// Fill in the rest of a compaction after `inputs[0]` is chosen:
+    ///   * `inputs[1]` — the files one level down that overlap inputs[0]'s range,
+    ///   * `grandparents` — files two levels down in the merged range, used to
+    ///     decide when to stop an output file,
+    ///   * and advance the level's compaction pointer so the next compaction
+    ///     picks a different range (even if this one fails).
     fn setupOtherInputs(self: *VersionSet, c: *Compaction) Error!void {
         const gpa = self.gpa;
         const level: usize = c.level_;
@@ -981,6 +1090,8 @@ pub const VersionSet = struct {
             c.grandparents = try gpa.dupe(*FileMetaData, gp.items);
         }
 
+        // Update the pointer before the compaction runs, so a failed compaction
+        // retries a different range instead of looping on the same one.
         self.compact_pointer[level].clearRetainingCapacity();
         try self.compact_pointer[level].appendSlice(gpa, range.largest);
         try c.edit.setCompactPointer(@intCast(level), range.largest);
@@ -1012,11 +1123,21 @@ pub const VersionSet = struct {
 // VersionSet.Builder
 // ---------------------------------------------------------------------------
 
+/// Builds a new immutable `Version` by applying one or more `VersionEdit`s to a
+/// base version.
+///
+/// The builder collects additions and deletions per level, then `saveTo` merges
+/// them with the base. This is used in two places:
+///   * `logAndApply`, to install a new version after a change, and
+///   * `recover`, to replay a MANIFEST from the beginning.
 const Builder = struct {
     gpa: Allocator,
     vset: *VersionSet,
+    /// The version the edits apply to. Held by reference.
     base: *Version,
+    /// File numbers removed, per level.
     deleted: [kNumLevels]ArrayList(u64) = [_]ArrayList(u64){.empty} ** kNumLevels,
+    /// New files, per level. Owned by the builder until handed to a version.
     added: [kNumLevels]ArrayList(*FileMetaData) = [_]ArrayList(*FileMetaData){.empty} ** kNumLevels,
 
     fn init(vset: *VersionSet, base: *Version) Builder {
@@ -1038,6 +1159,7 @@ const Builder = struct {
         return false;
     }
 
+    /// Record one edit's changes. Does not touch the version yet.
     fn apply(self: *Builder, edit: *const VersionEdit) Error!void {
         const gpa = self.gpa;
 
@@ -1049,24 +1171,35 @@ const Builder = struct {
         for (edit.deleted_files.items) |df| {
             try self.deleted[df.level].append(gpa, df.number);
         }
-        for (edit.new_files.items) |nf| {
-            const f = try gpa.create(FileMetaData);
-            errdefer gpa.destroy(f);
-            f.* = try nf.meta.clone(gpa);
-            f.refs = 1;
-            f.allowed_seeks = @intCast(@max(f.file_size / 16384, 100));
+        for (edit.new_files.items) |f| {
+            const f_meta = try gpa.create(FileMetaData);
+            errdefer gpa.destroy(f_meta);
+            f_meta.* = try f.meta.clone(gpa);
+            // The builder owns one reference; `saveTo` adds another when the
+            // file is placed in the version, and `deinit` drops the builder's.
+            f_meta.refs = 1;
+            // Seek budget: roughly one seek per 16 KiB, at least 100. When it
+            // runs out, the file becomes a compaction candidate.
+            f_meta.allowed_seeks = @intCast(@max(f_meta.file_size / 16384, 100));
 
-            // A file added here cancels a deletion of the same number.
+            // A file added here cancels a deletion of the same number (a
+            // compaction can remove an old file and add a new one in one edit,
+            // and across edits an add can follow a delete).
             var i: usize = 0;
-            while (i < self.deleted[nf.level].items.len) {
-                if (self.deleted[nf.level].items[i] == f.number) {
-                    _ = self.deleted[nf.level].swapRemove(i);
+            while (i < self.deleted[f.level].items.len) {
+                if (self.deleted[f.level].items[i] == f_meta.number) {
+                    _ = self.deleted[f.level].swapRemove(i);
                 } else i += 1;
             }
-            try self.added[nf.level].append(gpa, f);
+            try self.added[f.level].append(gpa, f_meta);
         }
     }
 
+    /// Produce the new version `v` from the base plus the applied edits.
+    ///
+    /// For each level: keep base files that were not deleted, add the new files,
+    /// sort by smallest key, and take a reference to each. Levels 1..6 are
+    /// disjoint, so the sort produces the order reads expect.
     fn saveTo(self: *Builder, v: *Version) Error!void {
         const gpa = self.gpa;
         const icmp = self.vset.config.internal_comparator;

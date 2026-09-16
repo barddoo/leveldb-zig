@@ -190,8 +190,11 @@ pub const TableBuilder = struct {
 
         var trailer: [format.kBlockTrailerSize]u8 = undefined;
         trailer[0] = compression_type;
-        const crc = crc32c.extend(crc32c.value(&[_]u8{compression_type}), data);
-        coding.encodeFixed32(trailer[1..5], crc32c.mask(crc));
+        // The checksum covers the stored block bytes followed by the type byte.
+        var hasher = crc32c.Hasher.init();
+        hasher.update(data);
+        hasher.update(&[_]u8{compression_type});
+        coding.encodeFixed32(trailer[1..5], crc32c.mask(hasher.final()));
         try self.file.append(&trailer);
 
         self.offset += data.len + format.kBlockTrailerSize;

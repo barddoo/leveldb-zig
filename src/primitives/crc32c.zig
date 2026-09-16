@@ -1,48 +1,21 @@
-//! CRC-32C (Castagnoli) as used by the block and log trailers.
+//! CRC-32C (Castagnoli), used by block and log trailers.
 //!
-//! This is a straightforward reflected, table-driven implementation. It is not
-//! the fastest possible CRC (LevelDB uses a slicing-by-16 software path and an
-//! optional hardware instruction), but it is easy to read and produces exactly
-//! the same 32-bit values.
-//!
-//! LevelDB stores a *masked* CRC in files. Masking rotates the CRC so that a
-//! CRC computed over data that accidentally contains its own checksum does not
-//! trivially pass. Both halves are provided here.
+//! The algorithm comes from the standard library: `std.hash.crc.Crc32Iscsi` is
+//! CRC-32C (polynomial 0x1edc6f41, reflected input and output, initial/final
+//! 0xffffffff). We only add LevelDB's *masking* on top, which rotates the CRC
+//! before it is stored so that a CRC computed over data that accidentally
+//! contains its own checksum does not trivially pass.
 
 const std = @import("std");
 
-/// Reflected form of the Castagnoli polynomial (0x1EDC6F41 normal order).
-const polynomial: u32 = 0x82F6_3B78;
-
-const table: [256]u32 = blk: {
-    @setEvalBranchQuota(10000);
-    var t: [256]u32 = undefined;
-    for (0..256) |i| {
-        var crc: u32 = @intCast(i);
-        for (0..8) |_| {
-            if (crc & 1 != 0) {
-                crc = (crc >> 1) ^ polynomial;
-            } else {
-                crc >>= 1;
-            }
-        }
-        t[i] = crc;
-    }
-    break :blk t;
-};
-
-/// Continue an in-progress CRC. Pass 0 to start a fresh computation.
-pub fn extend(crc: u32, data: []const u8) u32 {
-    var l = crc ^ 0xffff_ffff;
-    for (data) |byte| {
-        l = (l >> 8) ^ table[@as(u8, @truncate(l)) ^ byte];
-    }
-    return l ^ 0xffff_ffff;
-}
+/// Streaming CRC-32C hasher. Use `Hasher.init()`, then `update` with each chunk
+/// (including the type byte), then `final()`. This is the documented public API
+/// of `std.hash.crc`, so it is stable across std copies.
+pub const Hasher = std.hash.crc.Crc32Iscsi;
 
 /// CRC of an entire buffer.
 pub fn value(data: []const u8) u32 {
-    return extend(0, data);
+    return Hasher.hash(data);
 }
 
 const mask_delta: u32 = 0xa282_ead8;
@@ -66,6 +39,7 @@ const testing = std.testing;
 test "standard vector" {
     // The canonical CRC-32C check value for the ASCII string "123456789".
     try testing.expectEqual(@as(u32, 0xE306_9283), value("123456789"));
+    try testing.expectEqual(@as(u32, 0), value(""));
 }
 
 test "rfc3720 section B.4" {
@@ -84,11 +58,15 @@ test "rfc3720 section B.4" {
     try testing.expectEqual(@as(u32, 0x113f_db5c), value(&buf));
 }
 
-test "extend is streaming-equivalent" {
+test "streaming equals one-shot" {
     const a = "the quick brown ";
     const b = "fox jumps over the lazy dog";
-    const whole = a ++ b;
-    try testing.expectEqual(value(whole), extend(value(a), b));
+
+    var hasher = Hasher.init();
+    hasher.update(a);
+    hasher.update(b);
+
+    try testing.expectEqual(value(a ++ b), hasher.final());
 }
 
 test "mask/unmask round trip" {

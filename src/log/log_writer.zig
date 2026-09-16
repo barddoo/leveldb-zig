@@ -16,18 +16,11 @@ const Error = @import("../db/env.zig").Error;
 pub const Writer = struct {
     dest: WritableFile,
     block_offset: usize,
-    type_crc: [5]u32,
 
     pub fn init(dest: WritableFile, dest_length: u64) Writer {
-        var type_crc: [5]u32 = undefined;
-        for (0..5) |i| {
-            const t = [1]u8{@intCast(i)};
-            type_crc[i] = crc32c.value(&t);
-        }
         return .{
             .dest = dest,
             .block_offset = @intCast(dest_length % log_format.block_size),
-            .type_crc = type_crc,
         };
     }
 
@@ -80,7 +73,11 @@ pub const Writer = struct {
         std.debug.assert(self.block_offset + log_format.header_size + data.len <= log_format.block_size);
 
         var header: [log_format.header_size]u8 = undefined;
-        const crc = crc32c.mask(crc32c.extend(self.type_crc[@intFromEnum(record_type)], data));
+        // The checksum covers the type byte followed by the payload.
+        var hasher = crc32c.Hasher.init();
+        hasher.update(&[_]u8{@intFromEnum(record_type)});
+        hasher.update(data);
+        const crc = crc32c.mask(hasher.final());
         coding.encodeFixed32(header[0..4], crc);
         header[4] = @truncate(data.len);
         header[5] = @truncate(data.len >> 8);

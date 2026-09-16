@@ -63,6 +63,12 @@ const MergingIterator = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
+    /// Pick the child with the smallest key as the current one.
+    ///
+    /// Ties are broken by child order: the *earliest* child wins because we only
+    /// replace `smallest` on a strictly-smaller key. This matters for level 0,
+    /// where files overlap and the caller passes them newest-first, so a newer
+    /// version of a key wins over an older one.
     fn findSmallest(self: *MergingIterator) void {
         var smallest = &self.children[0];
         for (self.children[1..]) |*child| {
@@ -75,6 +81,8 @@ const MergingIterator = struct {
         self.current = smallest;
     }
 
+    /// Pick the child with the largest key. Ties go to the *latest* child
+    /// (strictly-greater comparison), the mirror of `findSmallest`.
     fn findLargest(self: *MergingIterator) void {
         var largest = &self.children[0];
         for (self.children[1..]) |*child| {

@@ -416,6 +416,19 @@ pub const DBImpl = struct {
 
     // -- recovery ----------------------------------------------------------
 
+    /// Bring the DB back to a consistent state at open.
+    ///
+    /// Steps:
+    ///   1. create the directory and take the LOCK,
+    ///   2. if CURRENT is missing, create a fresh DB (or fail, depending on
+    ///      `create_if_missing`),
+    ///   3. replay the MANIFEST to rebuild the set of live files,
+    ///   4. replay every log file that is not already reflected in the MANIFEST
+    ///      (its writes were not yet flushed to a table),
+    ///   5. record the highest sequence seen so new writes continue after it.
+    ///
+    /// `edit` collects the level-0 tables produced by log replay; the caller
+    /// persists them with one `logAndApply`.
     fn recover(self: *DBImpl, edit: *VersionEdit, save_manifest: *bool) Error!void {
         const gpa = self.gpa;
 
@@ -431,9 +444,13 @@ pub const DBImpl = struct {
 
         try self.versions.recover(save_manifest);
 
+        // The MANIFEST tells us which log file is current and which one it
+        // replaced. Any log with a number at or above `min_log`, or equal to
+        // `prev_log`, may hold writes not yet in a table.
         const min_log = self.versions.logNumber();
         const prev_log = self.versions.prevLogNumber();
 
+        // Sanity check: every table the MANIFEST references must exist on disk.
         var expected = ArrayList(u64).empty;
         defer expected.deinit(gpa);
         try self.versions.addLiveFiles(&expected);
@@ -459,11 +476,14 @@ pub const DBImpl = struct {
             }
         }
 
+        // Replay oldest log first so sequence numbers stay ordered.
         std.mem.sort(u64, logs.items, {}, std.sort.asc(u64));
 
         var max_sequence: SequenceNumber = 0;
         for (logs.items) |log_number| {
             try self.recoverLogFile(log_number, edit, &max_sequence);
+            // The previous incarnation may not have recorded this log in the
+            // MANIFEST, so make sure its number is never reused.
             self.versions.markFileNumberUsed(log_number);
         }
 
@@ -472,6 +492,8 @@ pub const DBImpl = struct {
         }
     }
 
+    /// Replay one log file: read its write batches into a memtable and flush
+    /// full memtables to level-0 tables, recording each in `edit`.
     fn recoverLogFile(
         self: *DBImpl,
         log_number: u64,
@@ -488,6 +510,9 @@ pub const DBImpl = struct {
         };
         defer file.deinit(gpa);
 
+        // Checksums are always verified during recovery, even when
+        // paranoid_checks is off, so a corrupt record cannot inject a bogus
+        // sequence number into the DB.
         var reader = try log.reader.Reader.init(gpa, file, null, true, 0);
         defer reader.deinit();
 
@@ -497,6 +522,8 @@ pub const DBImpl = struct {
         while (try reader.readRecord()) |record| {
             if (record.len < write_batch_mod.header_size) continue;
 
+            // The record is exactly the bytes of a WriteBatch, so wrap it and
+            // apply it.
             var batch = try WriteBatch.init(gpa);
             defer batch.deinit();
             batch.rep.clearRetainingCapacity();
@@ -508,9 +535,12 @@ pub const DBImpl = struct {
             }
             try batch.insertInto(mem.?);
 
+            // Track the highest sequence so the DB resumes after it.
             const batch_end = batch.sequence() + batch.count();
             if (batch_end > max_sequence.*) max_sequence.* = batch_end - 1;
 
+            // Flush when the recovered memtable gets large, so a huge log does
+            // not have to fit in memory all at once.
             if (mem.?.approximateMemoryUsage() > self.options.write_buffer_size) {
                 var meta = FileMetaData{ .number = self.versions.newFileNumber() };
                 defer meta.deinit(gpa);
@@ -520,6 +550,7 @@ pub const DBImpl = struct {
             }
         }
 
+        // Flush whatever is left.
         if (mem) |m| {
             var meta = FileMetaData{ .number = self.versions.newFileNumber() };
             defer meta.deinit(gpa);
@@ -557,7 +588,13 @@ pub const DBImpl = struct {
 
     // -- write path --------------------------------------------------------
 
+    /// Ensure the active memtable has room for a write, rotating it if not.
     /// Must be called with the mutex held.
+    ///
+    /// This is also where write back-pressure lives. If level 0 is getting
+    /// crowded we slow writers down; if it is critically full we stop them until
+    /// the background worker catches up. Both cases wait on `bg_cv`, which the
+    /// worker broadcasts when it finishes.
     fn makeRoomForWrite(self: *DBImpl, force_in: bool) Error!void {
         const io = self.io;
         var force = force_in;
@@ -565,6 +602,7 @@ pub const DBImpl = struct {
         while (true) {
             if (self.bg_error) |e| return e;
 
+            // Soft limit: add a tiny delay to throttle the writer.
             if (allow_delay and self.versions.numLevelFiles(0) >= version_set.kL0_SlowdownWritesTrigger) {
                 self.mutex.unlock(io);
                 self.env.sleepMicros(1000);
@@ -577,17 +615,23 @@ pub const DBImpl = struct {
                 return; // room available
             }
 
+            // An immutable memtable is still waiting to be flushed: wait.
             if (self.imm != null) {
                 self.bg_cv.waitUncancelable(io, &self.mutex);
                 continue;
             }
 
+            // Hard limit: level 0 is critically full, so stop writes entirely.
             if (self.versions.numLevelFiles(0) >= version_set.kL0_StopWritesTrigger) {
                 self.bg_cv.waitUncancelable(io, &self.mutex);
                 continue;
             }
 
             // Rotate: install a new log and memtable, retire the old memtable.
+            //
+            // Ordering matters: the new log file must exist *before* the old
+            // memtable becomes immutable, or a crash could leave acknowledged
+            // writes with no log to recover them from.
             const new_log_number = self.versions.newFileNumber();
             const fname = try filename.logFileName(self.gpa, self.dbname, new_log_number);
             defer self.gpa.free(fname);
@@ -605,6 +649,7 @@ pub const DBImpl = struct {
             self.logfile_number = new_log_number;
             self.log_writer = log.writer.Writer.init(lfile, 0);
 
+            // The old memtable becomes immutable; the worker will flush it.
             self.imm = self.mem;
             self.has_imm.store(true, .release);
             const new_mem = try MemTable.create(self.gpa, self.internal_comparator);
@@ -614,11 +659,22 @@ pub const DBImpl = struct {
 
             self.maybeScheduleCompaction();
             if (self.single_threaded_fallback) {
+                // No worker: flush the immutable memtable right here.
                 try self.compactMemTable();
             }
         }
     }
 
+    /// Apply a batch atomically.
+    ///
+    /// Writers form a queue. Only the writer at the head does I/O; the others
+    /// wait on their own condition variable. When the head runs, it may merge
+    /// several waiting batches into one log append (group commit), which turns
+    /// N fsyncs into one under load.
+    ///
+    /// The mutex is released while appending to the log and inserting into the
+    /// memtable, so other threads can read. Correctness relies on the head
+    /// writer staying the head for the whole operation.
     pub fn write(self: *DBImpl, batch: *WriteBatch, opts: WriteOptions) Error!void {
         const io = self.io;
         var w = Writer{ .batch = batch, .sync = opts.sync };
@@ -628,6 +684,8 @@ pub const DBImpl = struct {
             self.mutex.unlock(io);
             return e;
         };
+        // Wait until we are the head writer, or until someone else completes us
+        // by folding our batch into their group.
         while (!w.done and self.writers.items[0] != &w) {
             w.cv.waitUncancelable(io, &self.mutex);
         }
@@ -637,6 +695,7 @@ pub const DBImpl = struct {
             return;
         }
 
+        // We are the head writer and hold the mutex.
         var status: ?Error = null;
         self.makeRoomForWrite(false) catch |e| {
             status = e;
@@ -645,12 +704,17 @@ pub const DBImpl = struct {
         var last_writer: *Writer = &w;
 
         if (status == null) {
+            // Pick up any batches that arrived while we were waiting. Sequence
+            // numbers are assigned here, before the lock is dropped, so writes
+            // are ordered by the log.
             const write_batch = try self.buildBatchGroup(&last_writer);
             write_batch.setSequence(last_sequence + 1);
             last_sequence += write_batch.count();
 
             self.mutex.unlock(io);
 
+            // Log first, then memtable. A write is only durable once the log
+            // append (and optional fsync) succeeds.
             var log_ok = self.log_writer != null;
             if (self.log_writer) |*lw| {
                 lw.addRecord(write_batch.contents()) catch {
@@ -672,6 +736,8 @@ pub const DBImpl = struct {
             self.mutex.lockUncancelable(io);
 
             if (!log_ok) {
+                // The log's contents are now unknown; refuse all future writes
+                // rather than risk returning data that was never persisted.
                 self.recordBackgroundError(error.IoError);
                 status = error.IoError;
             }
@@ -679,7 +745,8 @@ pub const DBImpl = struct {
             self.versions.setLastSequence(last_sequence);
         }
 
-        // Pop writers up through last_writer, completing folded-in waiters.
+        // Wake everyone whose batch we just wrote (all of them share our
+        // status), then wake the new head.
         while (true) {
             const ready = self.writers.items[0];
             _ = self.writers.orderedRemove(0);
@@ -698,7 +765,13 @@ pub const DBImpl = struct {
         if (status) |e| return e;
     }
 
+    /// Collect the head writer's batch plus as many following batches as fit.
     /// Must be called with the mutex held.
+    ///
+    /// Rules: never merge a sync write behind a non-sync write (it would lose
+    /// its durability guarantee), and cap the group at ~1 MiB. The first batch
+    /// is only copied into `tmp_batch` once a second batch joins, so the common
+    /// single-writer case allocates nothing.
     fn buildBatchGroup(self: *DBImpl, last_writer: **Writer) Error!*WriteBatch {
         const first = self.writers.items[0];
         var result: *WriteBatch = first.batch.?;
@@ -1139,11 +1212,21 @@ pub const DBImpl = struct {
         self.mutex.unlock(io);
     }
 
+    /// Merge a compaction's inputs into new files one level down.
+    ///
+    /// The inputs are already sorted and merged by `makeInputIterator`, so this
+    /// is a single ascending pass. For each entry it decides whether the entry
+    /// is still needed (see the drop rules below) and, if so, appends it to the
+    /// current output file, starting a new file when the current one is large
+    /// enough or would overlap too much of the next level.
     fn doCompactionWork(self: *DBImpl, c: *Compaction) Error!void {
         const gpa = self.gpa;
         const io = self.io;
         const ucmp = self.internal_comparator.user;
 
+        // The oldest snapshot that must still be able to read. Entries at or
+        // below this sequence may be dropped when a newer entry supersedes them;
+        // anything above it is newer than every reader and must be preserved.
         const smallest_snapshot = if (self.snapshots.isEmpty())
             self.versions.lastSequence()
         else
@@ -1192,6 +1275,18 @@ pub const DBImpl = struct {
                 try self.finishCompactionOutputFile(&compact);
             }
 
+            // Decide whether this entry is still needed. Two rules:
+            //
+            //   A. If we have already passed a newer version of the same user
+            //      key at or below the smallest snapshot, this older version is
+            //      hidden from every reader and can go.
+            //   B. A tombstone can go once it is at or below the smallest
+            //      snapshot and nothing in a deeper level could still be hidden
+            //      by it (`isBaseLevelForKey`). If deeper data exists, the
+            //      tombstone must stay to keep hiding it.
+            //
+            // Both rules are snapshot-safe: they never drop something a live
+            // snapshot still needs.
             var drop = false;
             if (parsed) |p| {
                 // Rule A: a newer entry for this key hides this one.
@@ -1239,21 +1334,31 @@ pub const DBImpl = struct {
         self.mutex.unlock(io);
     }
 
+    /// Compact an explicit key range (or the whole DB when both are null),
+    /// synchronously. Used by the public `CompactRange` and the CLI.
+    ///
+    /// It pushes files down one level at a time, from level 0 to the last, so a
+    /// key ends up as deep as its range allows. This is a simple full-compaction
+    /// strategy rather than LevelDB's background scheduling.
     pub fn compactRange(self: *DBImpl, begin: ?[]const u8, end: ?[]const u8) Error!void {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
+        // Wait for any in-flight memtable flush to finish.
         while (self.imm != null) {
             self.bg_cv.waitUncancelable(io, &self.mutex);
         }
 
         var level: u32 = 0;
         while (level + 1 < version_set.kNumLevels) : (level += 1) {
+            // Repeat until this level has no more files in range. `guard` is a
+            // safety net against a pathological loop.
             var guard: usize = 0;
             while (guard < 1000) : (guard += 1) {
                 const c = try self.versions.compactRange(level, begin, end);
                 const compaction = c orelse break;
+                // Do the I/O without the lock so writers are not blocked.
                 self.mutex.unlock(io);
                 self.doCompactionWork(compaction) catch |e| {
                     self.mutex.lockUncancelable(io);
